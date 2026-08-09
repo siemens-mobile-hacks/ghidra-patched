@@ -30,11 +30,16 @@ for patch in "${root_dir}"/patches/*.patch; do
 done
 
 cd "${source_dir}"
-./gradlew --no-daemon -I gradle/support/fetchDependencies.gradle
-if [[ "${GHIDRA_RUN_TESTS:-0}" == "1" ]]; then
-	./gradlew --no-daemon unitTestReport
+gradle=(./gradlew)
+if [[ "${OSTYPE}" == msys* || "${OSTYPE}" == cygwin* || "${OSTYPE}" == win32* ]]; then
+	gradle=(./gradlew.bat)
 fi
-./gradlew --no-daemon buildGhidra
+
+"${gradle[@]}" --no-daemon -I gradle/support/fetchDependencies.gradle
+if [[ "${GHIDRA_RUN_TESTS:-0}" == "1" ]]; then
+	"${gradle[@]}" --no-daemon unitTestReport
+fi
+"${gradle[@]}" --no-daemon buildGhidra
 
 mkdir -p "${root_dir}/dist"
 cp -v build/dist/*.zip "${root_dir}/dist/"
