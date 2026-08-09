@@ -22,6 +22,7 @@ if [[ "${current_revision}" != "${expected_revision}" ]]; then
 fi
 
 git -C "${source_dir}" reset --hard "${expected_revision}"
+git -C "${source_dir}" clean -fd
 
 for patch in "${root_dir}"/patches/*.patch; do
 	git -C "${source_dir}" apply --check "${patch}"
