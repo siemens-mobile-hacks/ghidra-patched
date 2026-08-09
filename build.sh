@@ -35,7 +35,12 @@ if [[ "${OSTYPE}" == msys* || "${OSTYPE}" == cygwin* || "${OSTYPE}" == win32* ]]
 	gradle=(./gradlew.bat)
 fi
 
-"${gradle[@]}" --no-daemon -I gradle/support/fetchDependencies.gradle
+fetch_args=(--no-daemon)
+if [[ "${GHIDRA_HIDE_DOWNLOAD_PROGRESS:-0}" == "1" ]]; then
+	fetch_args+=(-DhideDownloadProgress=true)
+fi
+
+"${gradle[@]}" "${fetch_args[@]}" -I gradle/support/fetchDependencies.gradle
 if [[ "${GHIDRA_RUN_TESTS:-0}" == "1" ]]; then
 	"${gradle[@]}" --no-daemon unitTestReport
 fi
