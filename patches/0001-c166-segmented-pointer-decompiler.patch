@@ -1,0 +1,320 @@
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
+index 15648f9663..772b65c562 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
+@@ -628,7 +628,7 @@ int4 ActionLaneDivide::apply(Funcdata &data)
+ int4 ActionSegmentize::apply(Funcdata &data)
+ 
+ {
+-  int4 numops = data.getArch()->userops.numSegmentOps();
++  int4 numops = data.getArch()->userops.numSegmentOpDefinitions();
+   if (numops==0) return 0;
+   if (localcount>0) return 0;	// Only perform once
+   localcount = 1;		// Mark as having performed once
+@@ -638,8 +638,7 @@ int4 ActionSegmentize::apply(Funcdata &data)
+   bindlist.push_back((Varnode *)0);
+ 
+   for(int4 i=0;i<numops;++i) {
+-    SegmentOp *segdef = data.getArch()->userops.getSegmentOp(i);
+-    if (segdef == (SegmentOp *)0) continue;
++    SegmentOp *segdef = data.getArch()->userops.getSegmentOpDefinition(i);
+     AddrSpace *spc = segdef->getSpace();
+ 
+     list<PcodeOp *>::const_iterator iter,enditer;
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/emulateutil.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/emulateutil.cc
+index 73fcfec97f..27b9aa802c 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/emulateutil.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/emulateutil.cc
+@@ -122,7 +122,7 @@ void EmulatePcodeOp::executeIndirect(void)
+ void EmulatePcodeOp::executeSegmentOp(void)
+ 
+ {
+-  SegmentOp *segdef = glb->userops.getSegmentOp(currentOp->getIn(0)->getSpaceFromConst()->getIndex());
++  SegmentOp *segdef = glb->userops.getSegmentOp(currentOp);
+   if (segdef == (SegmentOp *)0)
+     throw LowlevelError("Segment operand missing definition");
+ 
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/op.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/op.cc
+index f1dd827b19..b78b559680 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/op.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/op.cc
+@@ -465,8 +465,8 @@ void PcodeOp::encode(Encoder &encoder) const
+ }
+ 
+ /// Assuming all the inputs to this op are constants, compute the constant result of evaluating
+-/// this op on this inputs. If one if the inputs has attached symbol information,
+-/// pass-back "the fact of" as we may want to propagate the info to the new constant.
++/// this op on this inputs. If one of the inputs has attached symbol information or is an already
++/// resolved pointer, pass-back "the fact of" as we may want to propagate it to the new constant.
+ /// Throw an exception if a constant result cannot be produced.
+ /// \param markedInput will pass-back whether or not one of the inputs is a marked constant
+ /// \return the constant result
+@@ -475,7 +475,7 @@ uintb PcodeOp::collapse(bool &markedInput) const {
+   const Varnode *vn1;
+ 
+   vn0 = getIn(0);
+-  if (vn0->getSymbolEntry() != (SymbolEntry *)0) {
++  if (vn0->getSymbolEntry() != (SymbolEntry *)0 || vn0->isResolvedPointer()) {
+     markedInput = true;
+   }
+   switch(getEvalType()) {
+@@ -483,7 +483,7 @@ uintb PcodeOp::collapse(bool &markedInput) const {
+     return opcode->evaluateUnary(output->getSize(),vn0->getSize(),vn0->getOffset());
+   case PcodeOp::binary:
+     vn1 = getIn(1);
+-    if (vn1->getSymbolEntry() != (SymbolEntry *)0) {
++    if (vn1->getSymbolEntry() != (SymbolEntry *)0 || vn1->isResolvedPointer()) {
+       markedInput = true;
+     }
+     return opcode->evaluateBinary(output->getSize(),vn0->getSize(),
+@@ -551,16 +551,19 @@ void PcodeOp::collapseConstantSymbol(Varnode *newConst) const
+     case CPUI_INT_OR:
+     case CPUI_INT_XOR:
+       copyVn = getIn(0);
+-      if (copyVn->getSymbolEntry() == (SymbolEntry *)0) {
++      if (copyVn->getSymbolEntry() == (SymbolEntry *)0 && !copyVn->isResolvedPointer()) {
+ 	copyVn = getIn(1);
+       }
+       break;
+     default:
+       return;
+   }
+-  if (copyVn->getSymbolEntry() == (SymbolEntry *)0)
+-	return;				// The first input must be marked
+-  newConst->copySymbolIfValid(copyVn);
++  if (copyVn->getSymbolEntry() == (SymbolEntry *)0 && !copyVn->isResolvedPointer())
++    return;				// The first input must be marked
++  if (copyVn->getSymbolEntry() != (SymbolEntry *)0)
++    newConst->copySymbolIfValid(copyVn);
++  if (copyVn->isResolvedPointer())
++    newConst->setResolvedPointer();
+ }
+ 
+ /// Compute nonzeromask assuming inputs to op have their masks properly defined. Assume the op has an output.
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc
+index 6ccbfd1a98..5910586ab8 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc
+@@ -1767,7 +1767,13 @@ bool PrintC::pushPtrCharConstant(uintb val,const TypePointer *ct,const Varnode *
+   Address point;
+   if (op != (const PcodeOp *)0)
+     point = op->getAddr();
+-  Address stringaddr = glb->resolveConstant(spc,val,ct->getSize(),point,fullEncoding);
++  Address stringaddr;
++  if (vn != (const Varnode *)0 && vn->isResolvedPointer()) {
++    fullEncoding = val;
++    stringaddr = Address(spc,AddrSpace::addressToByte(val,spc->getWordSize()));
++  }
++  else
++    stringaddr = glb->resolveConstant(spc,val,ct->getSize(),point,fullEncoding);
+   if (stringaddr.isInvalid()) return false;
+   if (!glb->symboltab->getGlobalScope()->isReadOnly(stringaddr,1,Address()))
+     return false;	     // Check that string location is readonly
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
+index accecb0904..1b012210ee 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
+@@ -7316,6 +7316,7 @@ bool RulePtrsubCharConstant::pushConstFurther(Funcdata &data,TypePointer *outtyp
+   val += addval;
+   Varnode *newconst = data.newConstant(vn->getSize(),val);
+   newconst->updateType(outtype);		// Put the pointer datatype on new constant
++  newconst->setResolvedPointer();	// PTRSUB offsets are already addresses in the target space
+   data.opRemoveInput(op,2);
+   data.opRemoveInput(op,1);
+   data.opSetOpcode(op,CPUI_COPY);
+@@ -7379,6 +7380,7 @@ int4 RulePtrsubCharConstant::applyOp(PcodeOp *op,Funcdata &data)
+   else {	// Convert the original PTRSUB to a COPY of the constant
+     Varnode *newvn = data.newConstant(outvn->getSize(),vn1->getOffset());
+     newvn->updateType(outtype);
++    newvn->setResolvedPointer();	// PTRSUB offsets are already addresses in the target space
+     data.opRemoveInput(op,1);
+     data.opSetInput(op,newvn,0);
+     data.opSetOpcode(op,CPUI_COPY);
+@@ -8981,7 +8983,7 @@ void RuleSegment::getOpList(vector<uint4> &oplist) const
+ int4 RuleSegment::applyOp(PcodeOp *op,Funcdata &data)
+ 
+ {
+-  SegmentOp *segdef = data.getArch()->userops.getSegmentOp(op->getIn(0)->getSpaceFromConst()->getIndex());
++  SegmentOp *segdef = data.getArch()->userops.getSegmentOp(op);
+   if (segdef == (SegmentOp *)0)
+     throw LowlevelError("Segment operand missing definition");
+ 
+@@ -8993,9 +8995,11 @@ int4 RuleSegment::applyOp(PcodeOp *op,Funcdata &data)
+     bindlist.push_back(vn1->getOffset());
+     bindlist.push_back(vn2->getOffset());
+     uintb val = segdef->execute(bindlist);
++    Varnode *newvn = data.newConstant(op->getOut()->getSize(),val);
++    newvn->setResolvedPointer();	// Segment execution produces an address-space offset
+     data.opRemoveInput(op,2);
+     data.opRemoveInput(op,1);
+-    data.opSetInput(op,data.newConstant(op->getOut()->getSize(),val),0);
++    data.opSetInput(op,newvn,0);
+     data.opSetOpcode(op,CPUI_COPY);
+     return 1;
+   }
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/userop.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/userop.cc
+index c9074bfa6c..dee9bcf2a0 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/userop.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/userop.cc
+@@ -184,6 +184,7 @@ SegmentOp::SegmentOp(const string &nm,Architecture *g,int4 ind)
+   : TermPatternOp(nm,g,segment,ind)
+ {
+   constresolve.space = (AddrSpace *)0;
++  outputsize = 0;
+ }
+ 
+ bool SegmentOp::unify(Funcdata &data,PcodeOp *op,
+@@ -278,6 +279,7 @@ void SegmentOp::decode(Decoder &decoder)
+   InjectPayload *payload = glb->pcodeinjectlib->getPayload(injectId);
+   if (payload->sizeOutput() != 1)
+     throw LowlevelError("<pcode> child of <segmentop> tag must declare one <output>");
++  outputsize = payload->getOutput(0).getSize();
+   if (payload->sizeInput() == 1) {
+     innerinsize = payload->getInput(0).getSize();
+   }
+@@ -516,17 +518,53 @@ void UserOpManage::registerOp(UserPcodeOp *op)
+   SegmentOp *s_op = dynamic_cast<SegmentOp *>(op);
+   if (s_op != (SegmentOp *)0) {
+     int4 index = s_op->getSpace()->getIndex();
++
++    for(int4 i=0;i<segmentoplist.size();++i) {
++      SegmentOp *other = segmentoplist[i];
++      if (other->getSpace() == s_op->getSpace() &&
++	  other->getBaseSize() == s_op->getBaseSize() &&
++	  other->getInnerSize() == s_op->getInnerSize() &&
++	  other->getOutputSize() == s_op->getOutputSize())
++	throw LowlevelError("Ambiguous segmentops defined for same space and sizes");
++    }
+   
+     while(segmentop.size() <= index)
+       segmentop.push_back((SegmentOp *)0);
+     
+-    if (segmentop[index] != (SegmentOp *)0)
+-      throw LowlevelError("Multiple segmentops defined for same space");
+-    segmentop[index] = s_op;
++    if (segmentop[index] == (SegmentOp *)0)
++      segmentop[index] = s_op;
++    segmentoplist.push_back(s_op);
+     return;
+   }
+ }
+ 
++/// Retrieve the SegmentOp definition matching an internal CPUI_SEGMENTOP.
++/// Multiple definitions may target the same address space but use different
++/// input or output sizes.  The first definition remains the canonical one for
++/// pointer-size and resolver properties.
++/// \param op is the internal CPUI_SEGMENTOP
++/// \return the matching definition, or null
++SegmentOp *UserOpManage::getSegmentOp(const PcodeOp *op) const
++
++{
++  AddrSpace *spc = op->getIn(0)->getSpaceFromConst();
++  int4 baseSize = op->getIn(1)->getSize();
++  int4 innerSize = op->getIn(2)->getSize();
++  int4 outputSize = op->getOut()->getSize();
++  for(int4 i=0;i<segmentoplist.size();++i) {
++    SegmentOp *segmentDef = segmentoplist[i];
++    int4 expectedBaseSize = segmentDef->getBaseSize();
++    if (expectedBaseSize == 0)
++      expectedBaseSize = 4;	// Internal SEGMENTOP always has an explicit base input
++    if (segmentDef->getSpace() == spc &&
++	expectedBaseSize == baseSize &&
++	segmentDef->getInnerSize() == innerSize &&
++	segmentDef->getOutputSize() == outputSize)
++      return segmentDef;
++  }
++  return (SegmentOp *)0;
++}
++
+ /// Create a SegmentOp description object based on the element and
+ /// register it with \b this manager.
+ /// \param decoder is the stream decoder
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/userop.hh b/Ghidra/Features/Decompiler/src/decompile/cpp/userop.hh
+index fda329a171..ad66db0699 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/userop.hh
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/userop.hh
+@@ -266,6 +266,7 @@ class SegmentOp : public TermPatternOp {
+   int4 injectId;		///< Id of InjectPayload that emulates \b this operation
+   int4 baseinsize;		///< The size in bytes of the \e base or \e segment value
+   int4 innerinsize;		///< The size in bytes of the \e near pointer value
++  int4 outputsize;		///< The size in bytes of the full low-level pointer
+   bool supportsfarpointer;	///< Is \b true if the joined pair base:near acts as a \b far pointer
+   VarnodeData constresolve;	///< How to resolve constant near pointers
+ public:
+@@ -274,6 +275,7 @@ public:
+   bool hasFarPointerSupport(void) const { return supportsfarpointer; }	///< Return \b true, if \b this op supports far pointers
+   int4 getBaseSize(void) const { return baseinsize; }		///< Get size in bytes of the base/segment value
+   int4 getInnerSize(void) const { return innerinsize; }		///< Get size in bytes of the near value
++  int4 getOutputSize(void) const { return outputsize; }		///< Get size in bytes of the output value
+   const VarnodeData &getResolve(void) const { return constresolve; }	///< Get the default register for resolving indirect segments
+   virtual int4 getNumVariableTerms(void) const { if (baseinsize!=0) return 2; return 1; }
+   virtual bool unify(Funcdata &data,PcodeOp *op,vector<Varnode *> &bindlist) const;
+@@ -328,13 +330,15 @@ class UserOpManage {
+   vector<UserPcodeOp *> useroplist;	///< Description objects indexed by CALLOTHER constant id
+   map<uint4,UserPcodeOp *> builtinmap;	///< Map from builtin ids to description objects
+   map<string,UserPcodeOp *> useropmap;	///< A map from the name of the user defined operation to a description object
+-  vector<SegmentOp *> segmentop;	///< Segment operations supported by this Architecture
++  vector<SegmentOp *> segmentop;	///< Canonical segment operation indexed by address space
++  vector<SegmentOp *> segmentoplist;	///< All segment operations, including alternate forms for a space
+   void registerOp(UserPcodeOp *op);	///< Insert a new UserPcodeOp description object in the map(s)
+ public:
+   UserOpManage(void);			///< Construct an empty manager
+   ~UserOpManage(void);			///< Destructor
+   void initialize(Architecture *g);	///< Initialize description objects for all user defined ops
+-  int4 numSegmentOps(void) const { return segmentop.size(); }	///< Number of segment operations supported
++  int4 numSegmentOps(void) const { return segmentop.size(); }	///< Size of the address-space indexed table
++  int4 numSegmentOpDefinitions(void) const { return segmentoplist.size(); }	///< Number of segment-op definitions
+ 
+   UserPcodeOp *getOp(uint4 i) const;		///< Retrieve a user-op description object by index
+   UserPcodeOp *getOp(const string &nm) const;	///< Retrieve description by name
+@@ -348,6 +352,8 @@ public:
+     if (i>=segmentop.size()) return (SegmentOp *)0;
+     return segmentop[i];
+   }
++  SegmentOp *getSegmentOpDefinition(int4 i) const { return segmentoplist[i]; }	///< Retrieve a segment-op definition
++  SegmentOp *getSegmentOp(const PcodeOp *op) const;	///< Retrieve the segment-op matching an internal op
+ 
+   void decodeSegmentOp(Decoder &decoder,Architecture *glb);			///< Parse a \<segmentop> element
+   void decodeVolatile(Decoder &decoder,Architecture *glb);			///< Parse a \<volatile> element
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.cc
+index 51a0751b5d..4f288151a0 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.cc
+@@ -519,6 +519,8 @@ void Varnode::copySymbol(const Varnode *vn)
+ {
+   type = vn->type;		// Copy any type
+   mapentry = vn->mapentry;	// Copy any symbol
++  addlflags = (addlflags & ~Varnode::resolved_pointer) |
++    (vn->addlflags & Varnode::resolved_pointer);
+   flags &= ~(Varnode::typelock | Varnode::namelock);
+   flags |= (Varnode::typelock | Varnode::namelock) & vn->flags;
+   if (high != (HighVariable *)0) {
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.hh b/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.hh
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.hh
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.hh
+@@ -129,7 +129,8 @@ public:
+     spacebase_placeholder = 0x400, ///< This varnode is inserted artificially to track a register
+ 				///< value at a specific point in the code
+     stop_uppropagation = 0x800,	///< Data-types do not propagate from an output into \b this
+-    has_implied_field = 0x1000	///< The varnode is implied but also has a data-type that needs resolution
++    has_implied_field = 0x1000,	///< The varnode is implied but also has a data-type that needs resolution
++    resolved_pointer = 0x2000	///< Constant is already an offset in its target address space
+   };
+ private:
+   mutable uint4 flags;		///< The collection of boolean attributes for this Varnode
+@@ -258,6 +259,7 @@ public:
+   bool isProtoPartial(void) const { return ((flags&Varnode::proto_partial)!=0); } ///< Is \b this getting pieced together into a larger whole
+   bool isPtrCheck(void) const { return ((addlflags&Varnode::ptrcheck)!=0); } ///< Has \b this been checked as a constant pointer to a mapped symbol?
+   bool isPtrFlow(void) const { return ((addlflags&Varnode::ptrflow)!=0); } ///< Does this varnode flow to or from a known pointer
++  bool isResolvedPointer(void) const { return ((addlflags&Varnode::resolved_pointer)!=0); } ///< Is this a pointer constant already resolved to an address-space offset
+   bool isSpacebasePlaceholder(void) const { return ((addlflags&Varnode::spacebase_placeholder)!=0); } ///< Is \b this used specifically to track stackpointer values?
+   bool hasNoLocalAlias(void) const { return ((flags&Varnode::nolocalalias)!=0); } ///< Are there (not) any local pointers that might affect \b this?
+   bool isMark(void) const { return ((flags&Varnode::mark)!=0); } ///< Has \b this been visited by the current algorithm?
+@@ -316,6 +318,7 @@ public:
+   void clearPtrCheck(void) { addlflags &= ~Varnode::ptrcheck; } ///< Clear the pointer check mark on this Varnode
+   void setPtrFlow(void) { addlflags |= Varnode::ptrflow; } ///< Set \b this as flowing to or from pointer
+   void clearPtrFlow(void) { addlflags &= ~Varnode::ptrflow; } ///< Indicate that this varnode is not flowing to or from pointer
++  void setResolvedPointer(void) { addlflags |= Varnode::resolved_pointer; } ///< Mark a pointer constant as already resolved to an address-space offset
+   void setSpacebasePlaceholder(void) { addlflags |= Varnode::spacebase_placeholder; } ///< Mark \b this as a special Varnode for tracking stackpointer values
+   void clearSpacebasePlaceholder(void) { addlflags &= ~Varnode::spacebase_placeholder; } ///< Clear the stackpointer tracking mark
+   void setPrecisLo(void) { setFlags(Varnode::precislo); } ///< Mark \b this as the low portion of a double precision value

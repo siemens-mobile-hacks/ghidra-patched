@@ -1,0 +1,122 @@
+name: Build Ghidra
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux_x86_64
+          - runner: windows-2022
+            platform: win_x86_64
+          - runner: macos-15-intel
+            platform: mac_x86_64
+          - runner: macos-15
+            platform: mac_arm_64
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Build
+        shell: bash
+        run: ./build.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ghidra-${{ matrix.platform }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  package:
+    name: Package multiplatform release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ghidra-*
+          path: artifacts
+
+      - name: Merge platform files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p package dist
+          linux_zip="$(find artifacts/ghidra-linux_x86_64 -name '*.zip' -print -quit)"
+          unzip -q "${linux_zip}" -d package
+          root="$(find package -mindepth 1 -maxdepth 1 -type d -name 'ghidra_*' -print -quit)"
+          test -n "${root}"
+
+          merge_platform() {
+            local artifact="$1"
+            shift
+            local archive temp source_root platform source_dir relative destination found
+            archive="$(find "artifacts/ghidra-${artifact}" -name '*.zip' -print -quit)"
+            temp="$(mktemp -d)"
+            unzip -q "${archive}" -d "${temp}"
+            source_root="$(find "${temp}" -mindepth 1 -maxdepth 1 -type d -name 'ghidra_*' -print -quit)"
+            test -n "${source_root}"
+            found=0
+
+            for platform in "$@"; do
+              while IFS= read -r -d '' source_dir; do
+                relative="${source_dir#"${source_root}/"}"
+                destination="${root}/$(dirname "${relative}")"
+                mkdir -p "${destination}"
+                cp -a "${source_dir}" "${destination}/"
+                found=1
+              done < <(find "${source_root}" -type d -path "*/os/${platform}" -print0)
+            done
+
+            test "${found}" -eq 1
+          }
+
+          merge_platform win_x86_64 win_x86_64 win_x86_32
+          merge_platform mac_x86_64 mac_x86_64
+          merge_platform mac_arm_64 mac_arm_64
+
+          test -x "${root}/Ghidra/Features/Decompiler/os/linux_x86_64/decompile"
+          test -f "${root}/Ghidra/Features/Decompiler/os/win_x86_64/decompile.exe"
+          test -x "${root}/Ghidra/Features/Decompiler/os/mac_x86_64/decompile"
+          test -x "${root}/Ghidra/Features/Decompiler/os/mac_arm_64/decompile"
+
+          root_name="$(basename "${root}")"
+          archive="${root_name}_$(date -u +%Y%m%d).zip"
+          (cd package && zip -qr "../dist/${archive}" "${root_name}")
+          sha256sum "dist/${archive}" > "dist/${archive}.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ghidra-multiplatform
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/* --generate-notes
+          fi
