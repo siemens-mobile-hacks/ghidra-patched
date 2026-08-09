@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - "v*"
+      - "*.*.*-*"
 
 permissions:
   contents: read
@@ -34,7 +34,12 @@ jobs:
           java-version: "21"
       - name: Build
         shell: bash
-        run: ./build.sh
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            GHIDRA_VERSION="${GITHUB_REF_NAME%-*}" ./build.sh
+          else
+            ./build.sh
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: ghidra-${{ matrix.platform }}
