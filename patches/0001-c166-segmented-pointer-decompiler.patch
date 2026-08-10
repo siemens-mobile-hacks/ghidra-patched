@@ -1,55 +1,103 @@
 diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
-index 15648f9663..772b65c562 100644
+index f1664ac3..204075c5 100644
 --- a/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
 +++ b/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
-@@ -628,7 +628,7 @@ int4 ActionLaneDivide::apply(Funcdata &data)
- int4 ActionSegmentize::apply(Funcdata &data)
+@@ -1213,6 +1213,23 @@ int4 ActionConstantPtr::apply(Funcdata &data)
+ 	data.opSwapInput(op,0,1);
+       count += 1;
+     }
++    else if (!rampoint.isInvalid() && vn->getTypeReadFacing(op)->getMetatype() == TYPE_PTR) {
++      TypePointer *ptrtype = (TypePointer *)vn->getTypeReadFacing(op);
++      AddrSpace *ptrspc = ptrtype->getSpace();
++      if (ptrspc == (AddrSpace *)0)
++	ptrspc = glb->getDefaultDataSpace();
++      SegmentOp *segdef = glb->userops.getSegmentOp(ptrspc->getIndex());
++      if (segdef != (SegmentOp *)0 && segdef->hasFarPointerSupport() &&
++	  vn->getSize() > segdef->getInnerSize()) {
++	uintb val = AddrSpace::byteToAddress(rampoint.getOffset(),ptrspc->getWordSize());
++	Varnode *newvn = data.newConstant(vn->getSize(),val);
++	newvn->updateType(ptrtype);
++	newvn->setResolvedPointer();
++	newvn->setPtrCheck();
++	data.opSetInput(op,newvn,slot);
++	count += 1;
++      }
++    }
+   }
+   return 0;
+ }
+@@ -5337,7 +5354,8 @@ void ActionInferTypes::propagateSpacebaseRef(Funcdata &data,Varnode *spcvn)
+     case CPUI_PTRSUB:
+       vn = op->getIn(1);
+       if (vn->isConstant()) {
+-	addr = sbtype->getAddress(vn->getOffset(),vn->getSize(),op->getAddr());
++	addr = sbtype->getAddress(vn->getOffset(),vn->getSize(),op->getAddr(),
++				  vn->isResolvedPointer());
+ 	propagateRef(data,op->getOut(),addr);
+       }
+       break;
+@@ -5688,6 +5706,7 @@ void ActionDatabase::universalAction(Architecture *conf)
+ 	actprop->addRule( new RuleInt2FloatCollapse("analysis") );
+ 	actprop->addRule( new RulePtraddUndo("typerecovery") );
+ 	actprop->addRule( new RulePtrsubUndo("typerecovery") );
++	actprop->addRule( new RulePieceFarPointer("segment") );
+ 	actprop->addRule( new RuleSegment("segment") );
+ 	actprop->addRule( new RulePiecePathology("protorecovery") );
  
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata.cc
+index 72809aef..dfb0313d 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata.cc
+@@ -362,6 +362,11 @@ void Funcdata::spacebaseConstant(PcodeOp *op,int4 slot,SymbolEntry *entry,const
  {
--  int4 numops = data.getArch()->userops.numSegmentOps();
-+  int4 numops = data.getArch()->userops.numSegmentOpDefinitions();
-   if (numops==0) return 0;
-   if (localcount>0) return 0;	// Only perform once
-   localcount = 1;		// Mark as having performed once
-@@ -638,8 +638,7 @@ int4 ActionSegmentize::apply(Funcdata &data)
-   bindlist.push_back((Varnode *)0);
- 
-   for(int4 i=0;i<numops;++i) {
--    SegmentOp *segdef = data.getArch()->userops.getSegmentOp(i);
--    if (segdef == (SegmentOp *)0) continue;
-+    SegmentOp *segdef = data.getArch()->userops.getSegmentOpDefinition(i);
-     AddrSpace *spc = segdef->getSpace();
- 
-     list<PcodeOp *>::const_iterator iter,enditer;
-diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/emulateutil.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/emulateutil.cc
-index 73fcfec97f..27b9aa802c 100644
---- a/Ghidra/Features/Decompiler/src/decompile/cpp/emulateutil.cc
-+++ b/Ghidra/Features/Decompiler/src/decompile/cpp/emulateutil.cc
-@@ -122,7 +122,7 @@ void EmulatePcodeOp::executeIndirect(void)
- void EmulatePcodeOp::executeSegmentOp(void)
- 
- {
--  SegmentOp *segdef = glb->userops.getSegmentOp(currentOp->getIn(0)->getSpaceFromConst()->getIndex());
-+  SegmentOp *segdef = glb->userops.getSegmentOp(currentOp);
-   if (segdef == (SegmentOp *)0)
-     throw LowlevelError("Segment operand missing definition");
- 
+   int4 sz = rampoint.getAddrSize();
+   AddrSpace *spaceid = rampoint.getSpace();
++  SegmentOp *segdef = glb->getSegmentOp(spaceid);
++  bool resolvedFarPointer = segdef != (SegmentOp *)0 &&
++	segdef->hasFarPointerSupport() && origsize > segdef->getInnerSize();
++  if (resolvedFarPointer)
++    origval = AddrSpace::byteToAddress(rampoint.getOffset(),spaceid->getWordSize());
+   Datatype *sb_type = glb->types->getTypeSpacebase(spaceid,Address());
+   sb_type = glb->types->getTypePointer(sz,sb_type,spaceid->getWordSize());
+   Varnode *spacebase_vn,*outvn,*newconst;
+@@ -404,6 +409,8 @@ void Funcdata::spacebaseConstant(PcodeOp *op,int4 slot,SymbolEntry *entry,const
+   // Make sure newconstant and extra preserve origval in address units
+   uintb newconstoff = origval - extra;		// everything is already in address units
+   newconst = newConstant(sz,newconstoff);
++  if (resolvedFarPointer)
++    newconst->setResolvedPointer();
+   newconst->setPtrCheck();	// No longer need to check this constant as a pointer
+   if (spaceid->isTruncated())
+     addOp->setPtrFlow();
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata_varnode.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata_varnode.cc
+index 2232a823..d9ccf64e 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata_varnode.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata_varnode.cc
+@@ -1220,7 +1220,8 @@ Symbol *Funcdata::linkSymbolReference(Varnode *vn)
+   if (sb->getMetatype() != TYPE_SPACEBASE)
+       return (Symbol *)0;
+   Scope *scope = sb->getMap();
+-  Address addr = sb->getAddress(vn->getOffset(),in0->getSize(),op->getAddr());
++  Address addr = sb->getAddress(vn->getOffset(),in0->getSize(),op->getAddr(),
++				vn->isResolvedPointer());
+   if (addr.isInvalid())
+     throw LowlevelError("Unable to generate proper address from spacebase");
+   SymbolEntry *entry = scope->queryContainer(addr,1,Address());
 diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/op.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/op.cc
-index f1dd827b19..b78b559680 100644
+index c60abf92..f6e8f678 100644
 --- a/Ghidra/Features/Decompiler/src/decompile/cpp/op.cc
 +++ b/Ghidra/Features/Decompiler/src/decompile/cpp/op.cc
-@@ -465,8 +465,8 @@ void PcodeOp::encode(Encoder &encoder) const
+@@ -442,7 +442,8 @@ void PcodeOp::encode(Encoder &encoder) const
  }
  
  /// Assuming all the inputs to this op are constants, compute the constant result of evaluating
 -/// this op on this inputs. If one if the inputs has attached symbol information,
--/// pass-back "the fact of" as we may want to propagate the info to the new constant.
-+/// this op on this inputs. If one of the inputs has attached symbol information or is an already
-+/// resolved pointer, pass-back "the fact of" as we may want to propagate it to the new constant.
++/// this op on this inputs. If one of the inputs has attached symbol information
++/// or is an already resolved pointer,
+ /// pass-back "the fact of" as we may want to propagate the info to the new constant.
  /// Throw an exception if a constant result cannot be produced.
  /// \param markedInput will pass-back whether or not one of the inputs is a marked constant
- /// \return the constant result
-@@ -475,7 +475,7 @@ uintb PcodeOp::collapse(bool &markedInput) const {
+@@ -452,7 +453,7 @@ uintb PcodeOp::collapse(bool &markedInput) const {
    const Varnode *vn1;
  
    vn0 = getIn(0);
@@ -58,7 +106,7 @@ index f1dd827b19..b78b559680 100644
      markedInput = true;
    }
    switch(getEvalType()) {
-@@ -483,7 +483,7 @@ uintb PcodeOp::collapse(bool &markedInput) const {
+@@ -460,7 +461,7 @@ uintb PcodeOp::collapse(bool &markedInput) const {
      return opcode->evaluateUnary(output->getSize(),vn0->getSize(),vn0->getOffset());
    case PcodeOp::binary:
      vn1 = getIn(1);
@@ -67,7 +115,7 @@ index f1dd827b19..b78b559680 100644
        markedInput = true;
      }
      return opcode->evaluateBinary(output->getSize(),vn0->getSize(),
-@@ -551,16 +551,19 @@ void PcodeOp::collapseConstantSymbol(Varnode *newConst) const
+@@ -528,16 +529,19 @@ void PcodeOp::collapseConstantSymbol(Varnode *newConst) const
      case CPUI_INT_OR:
      case CPUI_INT_XOR:
        copyVn = getIn(0);
@@ -80,10 +128,9 @@ index f1dd827b19..b78b559680 100644
        return;
    }
 -  if (copyVn->getSymbolEntry() == (SymbolEntry *)0)
--	return;				// The first input must be marked
--  newConst->copySymbolIfValid(copyVn);
 +  if (copyVn->getSymbolEntry() == (SymbolEntry *)0 && !copyVn->isResolvedPointer())
-+    return;				// The first input must be marked
+ 	return;				// The first input must be marked
+-  newConst->copySymbolIfValid(copyVn);
 +  if (copyVn->getSymbolEntry() != (SymbolEntry *)0)
 +    newConst->copySymbolIfValid(copyVn);
 +  if (copyVn->isResolvedPointer())
@@ -91,11 +138,208 @@ index f1dd827b19..b78b559680 100644
  }
  
  /// Compute nonzeromask assuming inputs to op have their masks properly defined. Assume the op has an output.
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/prettyprint.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/prettyprint.cc
+index f85f0185..e7624cf9 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/prettyprint.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/prettyprint.cc
+@@ -180,7 +180,8 @@ void EmitMarkup::endFuncProto(int4 id) {
+   encoder->closeElement(ELEM_FUNCPROTO);
+ }
+ 
+-void EmitMarkup::tagVariable(const string &name,syntax_highlight hl,const Varnode *vn,const PcodeOp *op)
++void EmitMarkup::tagVariable(const string &name,syntax_highlight hl,const Varnode *vn,
++			     const PcodeOp *op,const Address &resolved)
+ 
+ {
+   encoder->openElement(ELEM_VARIABLE);
+@@ -190,6 +191,10 @@ void EmitMarkup::tagVariable(const string &name,syntax_highlight hl,const Varnod
+     encoder->writeUnsignedInteger(ATTRIB_VARREF, vn->getCreateIndex());
+   if (op != (const PcodeOp *)0)
+     encoder->writeUnsignedInteger(ATTRIB_OPREF, op->getTime());
++  if (!resolved.isInvalid()) {
++    encoder->writeSpace(ATTRIB_SPACE,resolved.getSpace());
++    encoder->writeUnsignedInteger(ATTRIB_OFFSET,resolved.getOffset());
++  }
+   encoder->writeString(ATTRIB_CONTENT,name);
+   encoder->closeElement(ELEM_VARIABLE);
+ }
+@@ -412,7 +417,7 @@ void TokenSplit::print(Emit *emit) const
+     emit->endFuncProto(count);
+     break;
+   case vari_t:	// tagVariable
+-    emit->tagVariable(tok,hl,ptr_second.vn,op);
++    emit->tagVariable(tok,hl,ptr_second.vn,op,resolvedAddress);
+     break;
+   case op_t:		// tagOp
+     emit->tagOp(tok,hl,op);
+@@ -1035,12 +1040,13 @@ void EmitPrettyPrint::endFuncProto(int4 id)
+   scan();
+ }
+ 
+-void EmitPrettyPrint::tagVariable(const string &name,syntax_highlight hl,const Varnode *vn,const PcodeOp *op)
++void EmitPrettyPrint::tagVariable(const string &name,syntax_highlight hl,const Varnode *vn,
++				  const PcodeOp *op,const Address &resolved)
+ 
+ {
+   checkstring();
+   TokenSplit &tok( tokqueue.push() );
+-  tok.tagVariable(name,hl,vn,op);
++  tok.tagVariable(name,hl,vn,op,resolved);
+   scan();
+ }
+ 
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/prettyprint.hh b/Ghidra/Features/Decompiler/src/decompile/cpp/prettyprint.hh
+index bd65f4e2..31727008 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/prettyprint.hh
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/prettyprint.hh
+@@ -237,7 +237,8 @@ public:
+   /// \param hl indicates how the identifier should be highlighted
+   /// \param vn is the Varnode representing the variable within the syntax tree
+   /// \param op is a p-code operation related to the use of the variable (may be null)
+-  virtual void tagVariable(const string &name,syntax_highlight hl,const Varnode *vn,const PcodeOp *op)=0;
++  virtual void tagVariable(const string &name,syntax_highlight hl,const Varnode *vn,
++			   const PcodeOp *op,const Address &resolved=Address())=0;
+ 
+   /// \brief Emit an operation token
+   ///
+@@ -533,7 +534,8 @@ public:
+   virtual void endStatement(int4 id);
+   virtual int4 beginFuncProto(void);
+   virtual void endFuncProto(int4 id);
+-  virtual void tagVariable(const string &name,syntax_highlight hl,const Varnode *vn,const PcodeOp *op);
++  virtual void tagVariable(const string &name,syntax_highlight hl,const Varnode *vn,
++			   const PcodeOp *op,const Address &resolved=Address());
+   virtual void tagOp(const string &name,syntax_highlight hl,const PcodeOp *op);
+   virtual void tagFuncName(const string &name,syntax_highlight hl,const Funcdata *fd,const PcodeOp *op);
+   virtual void tagType(const string &name,syntax_highlight hl,const Datatype *ct);
+@@ -578,7 +580,8 @@ public:
+   virtual void endStatement(int4 id) {}
+   virtual int4 beginFuncProto(void) { return 0; }
+   virtual void endFuncProto(int4 id) {}
+-  virtual void tagVariable(const string &name,syntax_highlight hl,const Varnode *vn,const PcodeOp *op) {
++  virtual void tagVariable(const string &name,syntax_highlight hl,const Varnode *vn,
++			   const PcodeOp *op,const Address &resolved=Address()) {
+     *s << name; }
+   virtual void tagOp(const string &name,syntax_highlight hl,const PcodeOp *op) {
+     *s << name; }
+@@ -685,6 +688,7 @@ private:
+     const Symbol *symbol;	///< Associated Symbol being displayed
+   } ptr_second;			///< Additional markup associated with the token
+   uintb off;			///< Offset associated either with address or field markup
++  Address resolvedAddress;	///< Resolved physical address for a pointer token
+   int4 indentbump;		///< Amount to indent if a line breaks
+   int4 numspaces;		///< Number of spaces in a whitespace token (\e tokenbreak)
+   int4 size;			///< Number of content characters or other size information
+@@ -787,9 +791,11 @@ public:
+   /// \param h indicates how the identifier should be highlighted
+   /// \param v is the Varnode representing the variable within the syntax tree
+   /// \param o is a p-code operation related to the use of the variable (may be null)
+-  void tagVariable(const string &name,EmitMarkup::syntax_highlight h,const Varnode *v,const PcodeOp *o) {
++  void tagVariable(const string &name,EmitMarkup::syntax_highlight h,const Varnode *v,
++		   const PcodeOp *o,const Address &resolved=Address()) {
+     tok = name; size = tok.size();
+-    tagtype=vari_t; delimtype=tokenstring; hl=h; ptr_second.vn=v; op=o; }
++    tagtype=vari_t; delimtype=tokenstring; hl=h; ptr_second.vn=v; op=o;
++    resolvedAddress=resolved; }
+ 
+   /// \brief Create an operator token
+   ///
+@@ -1109,7 +1115,8 @@ public:
+   virtual void endStatement(int4 id);
+   virtual int4 beginFuncProto(void);
+   virtual void endFuncProto(int4 id);
+-  virtual void tagVariable(const string &name,syntax_highlight hl,const Varnode *vn,const PcodeOp *op);
++  virtual void tagVariable(const string &name,syntax_highlight hl,const Varnode *vn,
++			   const PcodeOp *op,const Address &resolved=Address());
+   virtual void tagOp(const string &name,syntax_highlight hl,const PcodeOp *op);
+   virtual void tagFuncName(const string &name,syntax_highlight hl,const Funcdata *fd,const PcodeOp *op);
+   virtual void tagType(const string &name,syntax_highlight hl,const Datatype *ct);
 diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc
-index 6ccbfd1a98..5910586ab8 100644
+index 00411be6..53fd6899 100644
 --- a/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc
 +++ b/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc
-@@ -1767,7 +1767,13 @@ bool PrintC::pushPtrCharConstant(uintb val,const TypePointer *ct,const Varnode *
+@@ -802,9 +802,48 @@ void PrintC::opReturn(const PcodeOp *op)
+   pushAtom(Atom(EMPTY_STRING,blanktoken,EmitMarkup::no_color));
+ }
+ 
++void PrintC::opCast(const PcodeOp *op)
++
++{
++  Datatype *outtype = op->getOut()->getHighTypeDefFacing();
++  const Varnode *invn = op->getIn(0);
++  if (outtype->getMetatype() == TYPE_PTR && invn->isWritten() &&
++	invn->getDef()->code() == CPUI_INT_ZEXT) {
++    const PcodeOp *zextop = invn->getDef();
++    const Varnode *ptrvn = zextop->getIn(0);
++    Datatype *intype = ptrvn->getHighTypeReadFacing(zextop);
++    AddrSpace *spc = glb->getDefaultDataSpace();
++    SegmentOp *segdef = glb->getSegmentOp(spc);
++    if (intype->getMetatype() == TYPE_PTR && segdef != (SegmentOp *)0 &&
++	segdef->hasFarPointerSupport() && ptrvn->getSize() == spc->getAddrSize() &&
++	op->getOut()->getSize() == segdef->getBaseSize() + segdef->getInnerSize()) {
++      opHiddenFunc(op);
++      return;
++    }
++  }
++  opTypeCast(op);
++}
++
+ void PrintC::opIntZext(const PcodeOp *op,const PcodeOp *readOp)
+ 
+ {
++  Datatype *intype = op->getIn(0)->getHighTypeReadFacing(op);
++  if (readOp != (const PcodeOp *)0 && intype->getMetatype() == TYPE_PTR) {
++    AddrSpace *spc = glb->getDefaultDataSpace();
++    SegmentOp *segdef = glb->getSegmentOp(spc);
++    Datatype *readtype = op->getOut()->getTypeReadFacing(readOp);
++    if (readtype->getMetatype() != TYPE_PTR && readOp->code() == CPUI_CAST)
++      readtype = readOp->getOut()->getHighTypeDefFacing();
++    if (segdef != (SegmentOp *)0 && segdef->hasFarPointerSupport() &&
++	readtype->getMetatype() == TYPE_PTR &&
++	op->getIn(0)->getSize() == spc->getAddrSize() &&
++	op->getOut()->getSize() == segdef->getBaseSize() + segdef->getInnerSize()) {
++      // The input is already a physical pointer.  The extension only adapts
++      // it to the architecture's high-level far-pointer storage width.
++      opHiddenFunc(op);
++      return;
++    }
++  }
+   if (castStrategy->isZextCast(op->getOut()->getHighTypeDefFacing(),op->getIn(0)->getHighTypeReadFacing(op))) {
+     if (option_hide_exts && castStrategy->isExtensionCastImplied(op,readOp))
+       opHiddenFunc(op);
+@@ -1096,7 +1135,8 @@ void PrintC::opPtrsub(const PcodeOp *op)
+     }
+     if (symbol == (Symbol *)0) {
+       TypeSpacebase *sb = (TypeSpacebase *)ct;
+-      Address addr = sb->getAddress(in1const,in0->getSize(),op->getAddr());
++      Address addr = sb->getAddress(in1const,in0->getSize(),op->getAddr(),
++				    op->getIn(1)->isResolvedPointer());
+       pushUnnamedLocation(addr,(Varnode *)0,op);
+     }
+     else {
+@@ -1352,7 +1392,8 @@ void PrintC::opSpullOp(const PcodeOp *op)
+ /// \param op is the PcodeOp using the value
+ /// \param displayFormat is the default display format (which can be 0 and may be overridden)
+ void PrintC::push_integer(uintb val,int4 sz,bool sign,tagtype tag,
+-			  const Varnode *vn,const PcodeOp *op,uint4 displayFormat)
++			  const Varnode *vn,const PcodeOp *op,uint4 displayFormat,
++			  const Address &resolvedAddress)
+ {
+   bool print_negsign;
+   bool force_unsigned_token;
+@@ -1427,7 +1468,10 @@ void PrintC::push_integer(uintb val,int4 sz,bool sign,tagtype tag,
+   if (force_sized_token)
+     t << sizeSuffix;
+ 
+-  pushAtom(Atom(t.str(),tag,EmitMarkup::const_color,op,vn,val));
++  if (resolvedAddress.isInvalid())
++    pushAtom(Atom(t.str(),tag,EmitMarkup::const_color,op,vn,val));
++  else
++    pushAtom(Atom(t.str(),tag,EmitMarkup::const_color,op,vn,val,resolvedAddress));
+ }
+ 
+ /// \brief Push a constant with a floating-point data-type to the RPN stack
+@@ -1767,7 +1811,13 @@ bool PrintC::pushPtrCharConstant(uintb val,const TypePointer *ct,const Varnode *
    Address point;
    if (op != (const PcodeOp *)0)
      point = op->getAddr();
@@ -110,41 +354,316 @@ index 6ccbfd1a98..5910586ab8 100644
    if (stringaddr.isInvalid()) return false;
    if (!glb->symboltab->getGlobalScope()->isReadOnly(stringaddr,1,Address()))
      return false;	     // Check that string location is readonly
+@@ -1777,7 +1827,11 @@ bool PrintC::pushPtrCharConstant(uintb val,const TypePointer *ct,const Varnode *
+   if (!printCharacterConstant(str,stringaddr,subct))
+     return false;		// Can we get a nice ASCII string
+ 
+-  pushAtom(Atom(str.str(),vartoken,EmitMarkup::const_color,op,vn));
++  SegmentOp *segdef = glb->getSegmentOp(spc);
++  if (segdef != (SegmentOp *)0 && segdef->hasFarPointerSupport())
++    pushAtom(Atom(str.str(),vartoken,EmitMarkup::const_color,op,vn,0,stringaddr));
++  else
++    pushAtom(Atom(str.str(),vartoken,EmitMarkup::const_color,op,vn));
+   return true;
+ }
+ 
+@@ -1808,6 +1862,7 @@ void PrintC::pushConstant(uintb val,const Datatype *ct,tagtype tag,
+ 			  const Varnode *vn,const PcodeOp *op,uint4 displayFormat)
+ {
+   Datatype *subtype;
++  Address resolvedAddress;
+   switch(ct->getMetatype()) {
+   case TYPE_UINT:
+     if (ct->isCharPrint())
+@@ -1849,6 +1904,27 @@ void PrintC::pushConstant(uintb val,const Datatype *ct,tagtype tag,
+       if (pushPtrCodeConstant(val,(const TypePointer *)ct,vn,op))
+ 	return;
+     }
++    {
++      const TypePointer *ptrtype = (const TypePointer *)ct;
++      AddrSpace *spc = ptrtype->getSpace();
++      if (spc == (AddrSpace *)0)
++	spc = glb->getDefaultDataSpace();
++      SegmentOp *segdef = glb->getSegmentOp(spc);
++      if (segdef != (SegmentOp *)0 && segdef->hasFarPointerSupport() &&
++	  ct->getSize() == segdef->getBaseSize() + segdef->getInnerSize()) {
++	if (vn != (const Varnode *)0 && vn->isResolvedPointer())
++	  resolvedAddress = Address(spc,AddrSpace::addressToByte(val,spc->getWordSize()));
++	else {
++	  uintb fullEncoding;
++	  Address point;
++	  if (op != (const PcodeOp *)0)
++	    point = op->getAddr();
++	  resolvedAddress = glb->resolveConstant(spc,val,ct->getSize(),point,fullEncoding);
++	  if (!resolvedAddress.isInvalid())
++	    val = AddrSpace::byteToAddress(resolvedAddress.getOffset(),spc->getWordSize());
++	}
++      }
++    }
+     break;
+   case TYPE_FLOAT:
+     push_float(val,ct->getSize(),tag,vn,op);
+@@ -1873,7 +1949,7 @@ void PrintC::pushConstant(uintb val,const Datatype *ct,tagtype tag,
+   pushMod();
+   if (!isSet(force_dec))
+     setMod(force_hex);
+-  push_integer(val,ct->getSize(),false,tag,vn,op,displayFormat);
++  push_integer(val,ct->getSize(),false,tag,vn,op,displayFormat,resolvedAddress);
+   popMod();
+ }
+ 
+@@ -1920,6 +1996,35 @@ bool PrintC::pushEquate(uintb val,int4 sz,const EquateSymbol *sym,const Varnode
+   return false;
+ }
+ 
++/// \brief Recover the physical address represented by a segmented symbol expression
++///
++/// A PTRSUB that names a symbol can still retain the original far-pointer encoding
++/// as its constant input.  The symbol mapping is already the resolved physical
++/// location, so attach it when it differs from the printed expression's encoding.
++Address PrintC::getResolvedSymbolAddress(const Symbol *sym,const PcodeOp *op) const
++
++{
++  if (op == (const PcodeOp *)0 || op->code() != CPUI_PTRSUB || op->numInput() < 2)
++    return Address();
++  const Varnode *encoding = op->getIn(1);
++  if (!encoding->isConstant())
++    return Address();
++  SymbolEntry *entry = sym->getFirstWholeMap();
++  if (entry == (SymbolEntry *)0)
++    return Address();
++  Address symbolAddress = entry->getAddr();
++  AddrSpace *spc = symbolAddress.getSpace();
++  SegmentOp *segdef = glb->getSegmentOp(spc);
++  if (segdef == (SegmentOp *)0 || !segdef->hasFarPointerSupport() ||
++      op->getOut() == (const Varnode *)0 || op->getOut()->getSize() != spc->getAddrSize())
++    return Address();
++  uintb physicalOffset = AddrSpace::byteToAddress(symbolAddress.getOffset(),
++						  spc->getWordSize());
++  if (!encoding->isResolvedPointer() && physicalOffset == encoding->getOffset())
++    return Address();
++  return symbolAddress;
++}
++
+ void PrintC::pushAnnotation(const Varnode *vn,const PcodeOp *op)
+ 
+ {
+@@ -1967,6 +2072,7 @@ void PrintC::pushAnnotation(const Varnode *vn,const PcodeOp *op)
+ void PrintC::pushSymbol(const Symbol *sym,const Varnode *vn,const PcodeOp *op)
+ 
+ {
++  Address resolvedAddress = getResolvedSymbolAddress(sym,op);
+   EmitMarkup::syntax_highlight tokenColor;
+   if (sym->isVolatile())
+     tokenColor = EmitMarkup::special_color;
+@@ -1990,11 +2096,17 @@ void PrintC::pushSymbol(const Symbol *sym,const Varnode *vn,const PcodeOp *op)
+       }
+       else
+ 	s << "$$";
+-      pushAtom(Atom(s.str(),vartoken,tokenColor,op,vn));
++      if (resolvedAddress.isInvalid())
++	pushAtom(Atom(s.str(),vartoken,tokenColor,op,vn));
++      else
++	pushAtom(Atom(s.str(),vartoken,tokenColor,op,vn,0,resolvedAddress));
+       return;
+     }
+   }
+-  pushAtom(Atom(sym->getDisplayName(),vartoken,tokenColor,op,vn));
++  if (resolvedAddress.isInvalid())
++    pushAtom(Atom(sym->getDisplayName(),vartoken,tokenColor,op,vn));
++  else
++    pushAtom(Atom(sym->getDisplayName(),vartoken,tokenColor,op,vn,0,resolvedAddress));
+ }
+ 
+ void PrintC::pushUnnamedLocation(const Address &addr,
+@@ -2003,7 +2115,11 @@ void PrintC::pushUnnamedLocation(const Address &addr,
+   ostringstream s;
+   s << addr.getSpace()->getName();
+   addr.printRaw(s);
+-  pushAtom(Atom(s.str(),vartoken,EmitMarkup::var_color,op,vn));
++  SegmentOp *segdef = glb->getSegmentOp(addr.getSpace());
++  if (segdef != (SegmentOp *)0 && segdef->hasFarPointerSupport())
++    pushAtom(Atom(s.str(),vartoken,EmitMarkup::var_color,op,vn,0,addr));
++  else
++    pushAtom(Atom(s.str(),vartoken,EmitMarkup::var_color,op,vn));
+ }
+ 
+ void PrintC::pushPartialSymbol(const Symbol *sym,int4 off,int4 sz,
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/printc.hh b/Ghidra/Features/Decompiler/src/decompile/cpp/printc.hh
+index fb0d2fd0..2b0a7254 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/printc.hh
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/printc.hh
+@@ -207,6 +207,7 @@ protected:
+ 			    const Varnode *vn,const PcodeOp *op,uint4 displayFormat);
+   virtual bool pushEquate(uintb val,int4 sz,const EquateSymbol *sym,
+ 			  const Varnode *vn,const PcodeOp *op);
++  Address getResolvedSymbolAddress(const Symbol *sym,const PcodeOp *op) const;
+   virtual void pushAnnotation(const Varnode *vn,const PcodeOp *op);
+   virtual void pushSymbol(const Symbol *sym,const Varnode *vn,const PcodeOp *op);
+   virtual void pushUnnamedLocation(const Address &addr,
+@@ -217,7 +218,8 @@ protected:
+ 				  const Varnode *vn,const PcodeOp *op);
+   virtual void pushImpliedField(const Varnode *vn,const PcodeOp *op);
+   virtual void push_integer(uintb val,int4 sz,bool sign,tagtype tag,
+-			    const Varnode *vn,const PcodeOp *op,uint4 displayFormat);
++			    const Varnode *vn,const PcodeOp *op,uint4 displayFormat,
++			    const Address &resolvedAddress=Address());
+   virtual void push_float(uintb val,int4 sz,tagtype tag,const Varnode *vn,
+ 			  const PcodeOp *op);
+   virtual void printUnicode(ostream &s,int4 onechar) const;
+@@ -335,7 +337,7 @@ public:
+   virtual void opIndirect(const PcodeOp *op) {}
+   virtual void opPiece(const PcodeOp *op) { opFunc(op); }
+   virtual void opSubpiece(const PcodeOp *op);
+-  virtual void opCast(const PcodeOp *op) { opTypeCast(op); }
++  virtual void opCast(const PcodeOp *op);
+   virtual void opPtradd(const PcodeOp *op);
+   virtual void opPtrsub(const PcodeOp *op);
+   virtual void opSegmentOp(const PcodeOp *op);
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/printlanguage.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/printlanguage.cc
+index 7f43d290..068f838b 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/printlanguage.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/printlanguage.cc
+@@ -381,7 +381,8 @@ void PrintLanguage::emitAtom(const Atom &atom)
+     emit->print(atom.name,atom.highlight);
+     break;
+   case vartoken:
+-    emit->tagVariable(atom.name,atom.highlight,atom.ptr_second.vn,atom.op);
++    emit->tagVariable(atom.name,atom.highlight,atom.ptr_second.vn,atom.op,
++		      atom.resolvedAddress);
+     break;
+   case functoken:
+     emit->tagFuncName(atom.name,atom.highlight,atom.ptr_second.fd,atom.op);
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/printlanguage.hh b/Ghidra/Features/Decompiler/src/decompile/cpp/printlanguage.hh
+index 222ac655..848bdc38 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/printlanguage.hh
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/printlanguage.hh
+@@ -220,6 +220,7 @@ public:
+       uintb intValue;		///< An integer value associated with the token
+     } ptr_second;		///< Other meta-data associated with the token
+     int4 offset;        	///< The offset (within the parent structure) for a \e field token
++    Address resolvedAddress;	///< Physical address represented by a pointer token
+ 
+     /// \brief Construct a token with no associated data-flow annotations
+     Atom(const string &nm,tagtype t,EmitMarkup::syntax_highlight hl)
+@@ -257,6 +258,16 @@ public:
+       op = o;
+     }
+ 
++    /// \brief Construct a variable token with an explicit physical address
++    Atom(const string &nm,tagtype t,EmitMarkup::syntax_highlight hl,const PcodeOp *o,
++	 const Varnode *v,uintb intValue,const Address &resolved)
++      : name(nm), resolvedAddress(resolved) {
++      type=t;
++      highlight = hl;
++      ptr_second.vn = v;
++      op = o;
++    }
++
+   };
+ private:
+   string name;				///< The name of the high-level language
 diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
-index accecb0904..1b012210ee 100644
+index 3071e766..204abd17 100644
 --- a/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
 +++ b/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
-@@ -7316,6 +7316,7 @@ bool RulePtrsubCharConstant::pushConstFurther(Funcdata &data,TypePointer *outtyp
+@@ -7338,7 +7338,8 @@ int4 RuleSubRight::applyOp(PcodeOp *op,Funcdata &data)
+ /// \param slot is the input slot receiving the collapsed PTRSUB
+ /// \param val is the constant pointer value
+ /// \return \b true if the descendant was collapsed
+-bool RulePtrsubCharConstant::pushConstFurther(Funcdata &data,TypePointer *outtype,PcodeOp *op,int4 slot,uintb val)
++bool RulePtrsubCharConstant::pushConstFurther(Funcdata &data,TypePointer *outtype,PcodeOp *op,
++					      int4 slot,uintb val,bool isResolved)
+ 
+ {
+   if (op->code() != CPUI_PTRADD) return false;		// Must be a PTRADD
+@@ -7350,6 +7351,8 @@ bool RulePtrsubCharConstant::pushConstFurther(Funcdata &data,TypePointer *outtyp
    val += addval;
    Varnode *newconst = data.newConstant(vn->getSize(),val);
    newconst->updateType(outtype);		// Put the pointer datatype on new constant
-+  newconst->setResolvedPointer();	// PTRSUB offsets are already addresses in the target space
++  if (isResolved)
++    newconst->setResolvedPointer();
    data.opRemoveInput(op,2);
    data.opRemoveInput(op,1);
    data.opSetOpcode(op,CPUI_COPY);
-@@ -7379,6 +7380,7 @@ int4 RulePtrsubCharConstant::applyOp(PcodeOp *op,Funcdata &data)
+@@ -7385,7 +7388,8 @@ int4 RulePtrsubCharConstant::applyOp(PcodeOp *op,Funcdata &data)
+   if (outtype->getMetatype() != TYPE_PTR) return 0;
+   Datatype *basetype = outtype->getPtrTo();
+   if (!basetype->isCharPrint()) return 0;
+-  Address symaddr = sbtype->getAddress(vn1->getOffset(),vn1->getSize(),op->getAddr());
++  Address symaddr = sbtype->getAddress(vn1->getOffset(),vn1->getSize(),op->getAddr(),
++				      vn1->isResolvedPointer());
+   Scope *scope = sbtype->getMap();
+   if (!scope->isReadOnly(symaddr,1,op->getAddr()))
+     return 0;
+@@ -7403,7 +7407,8 @@ int4 RulePtrsubCharConstant::applyOp(PcodeOp *op,Funcdata &data)
+     while(iter != enditer) {
+       PcodeOp *subop = *iter;	// Give each descendant of op a chance to further propagate the constant
+       ++iter;
+-      if (!pushConstFurther(data,outtype,subop,subop->getSlot(outvn),vn1->getOffset()))
++      if (!pushConstFurther(data,outtype,subop,subop->getSlot(outvn),vn1->getOffset(),
++			    vn1->isResolvedPointer()))
+ 	removeCopy = false;	// If the descendant does NOT propagate const, do NOT remove op
+     }
+   }
+@@ -7413,6 +7418,8 @@ int4 RulePtrsubCharConstant::applyOp(PcodeOp *op,Funcdata &data)
    else {	// Convert the original PTRSUB to a COPY of the constant
      Varnode *newvn = data.newConstant(outvn->getSize(),vn1->getOffset());
      newvn->updateType(outtype);
-+    newvn->setResolvedPointer();	// PTRSUB offsets are already addresses in the target space
++    if (vn1->isResolvedPointer())
++      newvn->setResolvedPointer();
      data.opRemoveInput(op,1);
      data.opSetInput(op,newvn,0);
      data.opSetOpcode(op,CPUI_COPY);
-@@ -8981,7 +8983,7 @@ void RuleSegment::getOpList(vector<uint4> &oplist) const
- int4 RuleSegment::applyOp(PcodeOp *op,Funcdata &data)
+@@ -9002,6 +9009,41 @@ Varnode *RuleSignMod2nOpt2::checkMultiequalForm(PcodeOp *op,uintb npow)
+   return base;
+ }
  
- {
--  SegmentOp *segdef = data.getArch()->userops.getSegmentOp(op->getIn(0)->getSpaceFromConst()->getIndex());
-+  SegmentOp *segdef = data.getArch()->userops.getSegmentOp(op);
-   if (segdef == (SegmentOp *)0)
-     throw LowlevelError("Segment operand missing definition");
- 
-@@ -8993,9 +8995,11 @@ int4 RuleSegment::applyOp(PcodeOp *op,Funcdata &data)
++/// \class RulePieceFarPointer
++/// \brief Convert a typed base:offset PIECE into a SEGMENTOP
++///
++/// A SegmentOp with far-pointer support describes an alternate pointer whose
++/// high-level representation is the concatenation of a base and near pointer.
++/// Once type recovery proves that a PIECE has this pointer type, express that
++/// relationship with the architecture's SEGMENTOP instead of printing a raw
++/// CONCAT.
++void RulePieceFarPointer::getOpList(vector<uint4> &oplist) const
++
++{
++  oplist.push_back(CPUI_PIECE);
++}
++
++int4 RulePieceFarPointer::applyOp(PcodeOp *op,Funcdata &data)
++
++{
++  Varnode *outvn = op->getOut();
++  Datatype *outtype = outvn->getTypeDefFacing();
++  if (outtype->getMetatype() != TYPE_PTR) return 0;
++  TypePointer *ptrtype = (TypePointer *)outtype;
++  AddrSpace *spc = ptrtype->getSpace();
++  if (spc == (AddrSpace *)0)
++    spc = data.getArch()->getDefaultDataSpace();
++  SegmentOp *segdef = data.getArch()->userops.getSegmentOp(spc->getIndex());
++  if (segdef == (SegmentOp *)0 || !segdef->hasFarPointerSupport()) return 0;
++  if (op->getIn(0)->getSize() != segdef->getBaseSize()) return 0;
++  if (op->getIn(1)->getSize() != segdef->getInnerSize()) return 0;
++  if (outvn->getSize() != segdef->getBaseSize() + segdef->getInnerSize()) return 0;
++
++  data.opInsertInput(op,data.newVarnodeSpace(spc),0);
++  data.opSetOpcode(op,CPUI_SEGMENTOP);
++  return 1;
++}
++
+ /// \class RuleSegment
+ /// \brief Propagate constants through a SEGMENTOP
+ void RuleSegment::getOpList(vector<uint4> &oplist) const
+@@ -9025,9 +9067,12 @@ int4 RuleSegment::applyOp(PcodeOp *op,Funcdata &data)
      bindlist.push_back(vn1->getOffset());
      bindlist.push_back(vn2->getOffset());
      uintb val = segdef->execute(bindlist);
 +    Varnode *newvn = data.newConstant(op->getOut()->getSize(),val);
-+    newvn->setResolvedPointer();	// Segment execution produces an address-space offset
++    if (segdef->hasFarPointerSupport())
++      newvn->setResolvedPointer();
      data.opRemoveInput(op,2);
      data.opRemoveInput(op,1);
 -    data.opSetInput(op,data.newConstant(op->getOut()->getSize(),val),0);
@@ -152,144 +671,82 @@ index accecb0904..1b012210ee 100644
      data.opSetOpcode(op,CPUI_COPY);
      return 1;
    }
-diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/userop.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/userop.cc
-index c9074bfa6c..dee9bcf2a0 100644
---- a/Ghidra/Features/Decompiler/src/decompile/cpp/userop.cc
-+++ b/Ghidra/Features/Decompiler/src/decompile/cpp/userop.cc
-@@ -184,6 +184,7 @@ SegmentOp::SegmentOp(const string &nm,Architecture *g,int4 ind)
-   : TermPatternOp(nm,g,segment,ind)
- {
-   constresolve.space = (AddrSpace *)0;
-+  outputsize = 0;
- }
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.hh b/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.hh
+index 5b8c80d2..96f1c87e 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.hh
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.hh
+@@ -1174,7 +1174,8 @@ public:
+ };
  
- bool SegmentOp::unify(Funcdata &data,PcodeOp *op,
-@@ -278,6 +279,7 @@ void SegmentOp::decode(Decoder &decoder)
-   InjectPayload *payload = glb->pcodeinjectlib->getPayload(injectId);
-   if (payload->sizeOutput() != 1)
-     throw LowlevelError("<pcode> child of <segmentop> tag must declare one <output>");
-+  outputsize = payload->getOutput(0).getSize();
-   if (payload->sizeInput() == 1) {
-     innerinsize = payload->getInput(0).getSize();
-   }
-@@ -516,17 +518,53 @@ void UserOpManage::registerOp(UserPcodeOp *op)
-   SegmentOp *s_op = dynamic_cast<SegmentOp *>(op);
-   if (s_op != (SegmentOp *)0) {
-     int4 index = s_op->getSpace()->getIndex();
-+
-+    for(int4 i=0;i<segmentoplist.size();++i) {
-+      SegmentOp *other = segmentoplist[i];
-+      if (other->getSpace() == s_op->getSpace() &&
-+	  other->getBaseSize() == s_op->getBaseSize() &&
-+	  other->getInnerSize() == s_op->getInnerSize() &&
-+	  other->getOutputSize() == s_op->getOutputSize())
-+	throw LowlevelError("Ambiguous segmentops defined for same space and sizes");
-+    }
-   
-     while(segmentop.size() <= index)
-       segmentop.push_back((SegmentOp *)0);
-     
--    if (segmentop[index] != (SegmentOp *)0)
--      throw LowlevelError("Multiple segmentops defined for same space");
--    segmentop[index] = s_op;
-+    if (segmentop[index] == (SegmentOp *)0)
-+      segmentop[index] = s_op;
-+    segmentoplist.push_back(s_op);
-     return;
-   }
- }
+ class RulePtrsubCharConstant : public Rule {
+-  bool pushConstFurther(Funcdata &data,TypePointer *outtype,PcodeOp *op,int4 slot,uintb val);
++  bool pushConstFurther(Funcdata &data,TypePointer *outtype,PcodeOp *op,int4 slot,uintb val,
++			bool isResolved);
+ public:
+   RulePtrsubCharConstant(const string &g) : Rule( g, 0, "ptrsubcharconstant") {}	///< Constructor
+   virtual Rule *clone(const ActionGroupList &grouplist) const {
+@@ -1397,6 +1398,17 @@ public:
+   virtual int4 applyOp(PcodeOp *op,Funcdata &data);
+ };
  
-+/// Retrieve the SegmentOp definition matching an internal CPUI_SEGMENTOP.
-+/// Multiple definitions may target the same address space but use different
-+/// input or output sizes.  The first definition remains the canonical one for
-+/// pointer-size and resolver properties.
-+/// \param op is the internal CPUI_SEGMENTOP
-+/// \return the matching definition, or null
-+SegmentOp *UserOpManage::getSegmentOp(const PcodeOp *op) const
-+
-+{
-+  AddrSpace *spc = op->getIn(0)->getSpaceFromConst();
-+  int4 baseSize = op->getIn(1)->getSize();
-+  int4 innerSize = op->getIn(2)->getSize();
-+  int4 outputSize = op->getOut()->getSize();
-+  for(int4 i=0;i<segmentoplist.size();++i) {
-+    SegmentOp *segmentDef = segmentoplist[i];
-+    int4 expectedBaseSize = segmentDef->getBaseSize();
-+    if (expectedBaseSize == 0)
-+      expectedBaseSize = 4;	// Internal SEGMENTOP always has an explicit base input
-+    if (segmentDef->getSpace() == spc &&
-+	expectedBaseSize == baseSize &&
-+	segmentDef->getInnerSize() == innerSize &&
-+	segmentDef->getOutputSize() == outputSize)
-+      return segmentDef;
++class RulePieceFarPointer : public Rule {
++public:
++  RulePieceFarPointer(const string &g) : Rule(g, 0, "piecefarpointer") {} ///< Constructor
++  virtual Rule *clone(const ActionGroupList &grouplist) const {
++    if (!grouplist.contains(getGroup())) return (Rule *)0;
++    return new RulePieceFarPointer(getGroup());
 +  }
-+  return (SegmentOp *)0;
-+}
++  virtual void getOpList(vector<uint4> &oplist) const;
++  virtual int4 applyOp(PcodeOp *op,Funcdata &data);
++};
 +
- /// Create a SegmentOp description object based on the element and
- /// register it with \b this manager.
- /// \param decoder is the stream decoder
-diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/userop.hh b/Ghidra/Features/Decompiler/src/decompile/cpp/userop.hh
-index fda329a171..ad66db0699 100644
---- a/Ghidra/Features/Decompiler/src/decompile/cpp/userop.hh
-+++ b/Ghidra/Features/Decompiler/src/decompile/cpp/userop.hh
-@@ -266,6 +266,7 @@ class SegmentOp : public TermPatternOp {
-   int4 injectId;		///< Id of InjectPayload that emulates \b this operation
-   int4 baseinsize;		///< The size in bytes of the \e base or \e segment value
-   int4 innerinsize;		///< The size in bytes of the \e near pointer value
-+  int4 outputsize;		///< The size in bytes of the full low-level pointer
-   bool supportsfarpointer;	///< Is \b true if the joined pair base:near acts as a \b far pointer
-   VarnodeData constresolve;	///< How to resolve constant near pointers
- public:
-@@ -274,6 +275,7 @@ public:
-   bool hasFarPointerSupport(void) const { return supportsfarpointer; }	///< Return \b true, if \b this op supports far pointers
-   int4 getBaseSize(void) const { return baseinsize; }		///< Get size in bytes of the base/segment value
-   int4 getInnerSize(void) const { return innerinsize; }		///< Get size in bytes of the near value
-+  int4 getOutputSize(void) const { return outputsize; }		///< Get size in bytes of the output value
-   const VarnodeData &getResolve(void) const { return constresolve; }	///< Get the default register for resolving indirect segments
-   virtual int4 getNumVariableTerms(void) const { if (baseinsize!=0) return 2; return 1; }
-   virtual bool unify(Funcdata &data,PcodeOp *op,vector<Varnode *> &bindlist) const;
-@@ -328,13 +330,15 @@ class UserOpManage {
-   vector<UserPcodeOp *> useroplist;	///< Description objects indexed by CALLOTHER constant id
-   map<uint4,UserPcodeOp *> builtinmap;	///< Map from builtin ids to description objects
-   map<string,UserPcodeOp *> useropmap;	///< A map from the name of the user defined operation to a description object
--  vector<SegmentOp *> segmentop;	///< Segment operations supported by this Architecture
-+  vector<SegmentOp *> segmentop;	///< Canonical segment operation indexed by address space
-+  vector<SegmentOp *> segmentoplist;	///< All segment operations, including alternate forms for a space
-   void registerOp(UserPcodeOp *op);	///< Insert a new UserPcodeOp description object in the map(s)
- public:
-   UserOpManage(void);			///< Construct an empty manager
-   ~UserOpManage(void);			///< Destructor
-   void initialize(Architecture *g);	///< Initialize description objects for all user defined ops
--  int4 numSegmentOps(void) const { return segmentop.size(); }	///< Number of segment operations supported
-+  int4 numSegmentOps(void) const { return segmentop.size(); }	///< Size of the address-space indexed table
-+  int4 numSegmentOpDefinitions(void) const { return segmentoplist.size(); }	///< Number of segment-op definitions
+ class RulePtrFlow : public Rule {
+   Architecture *glb;			///< The address space manager
+   bool hasTruncations;			///< \b true if this architecture needs truncated pointers
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/type.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/type.cc
+index e3601d3a..78207c18 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/type.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/type.cc
+@@ -3477,9 +3477,11 @@ int4 TypeSpacebase::compareDependency(const Datatype &op) const
+ /// \param sz is the size of offset (as a pointer)
+ /// \param point is a "context" reference for the request
+ /// \return the referred to Address
+-Address TypeSpacebase::getAddress(uintb off,int4 sz,const Address &point) const
++Address TypeSpacebase::getAddress(uintb off,int4 sz,const Address &point,bool isResolved) const
  
-   UserPcodeOp *getOp(uint4 i) const;		///< Retrieve a user-op description object by index
-   UserPcodeOp *getOp(const string &nm) const;	///< Retrieve description by name
-@@ -348,6 +352,8 @@ public:
-     if (i>=segmentop.size()) return (SegmentOp *)0;
-     return segmentop[i];
-   }
-+  SegmentOp *getSegmentOpDefinition(int4 i) const { return segmentoplist[i]; }	///< Retrieve a segment-op definition
-+  SegmentOp *getSegmentOp(const PcodeOp *op) const;	///< Retrieve the segment-op matching an internal op
- 
-   void decodeSegmentOp(Decoder &decoder,Architecture *glb);			///< Parse a \<segmentop> element
-   void decodeVolatile(Decoder &decoder,Architecture *glb);			///< Parse a \<volatile> element
+ {
++  if (isResolved)
++    return Address(spaceid,AddrSpace::addressToByte(off,spaceid->getWordSize()));
+   uintb fullEncoding;
+   // Currently a constant off of a global spacebase must be a full pointer encoding
+   if (localframe.isInvalid())
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/type.hh b/Ghidra/Features/Decompiler/src/decompile/cpp/type.hh
+index a49726b0..724ad795 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/type.hh
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/type.hh
+@@ -803,7 +803,7 @@ public:
+   TypeSpacebase(AddrSpace *id,const Address &frame,Architecture *g)
+     : Datatype(0,1,TYPE_SPACEBASE), localframe(frame) { spaceid = id; glb = g; }
+   Scope *getMap(void) const;	///< Get the symbol table indexed by \b this
+-  Address getAddress(uintb off,int4 sz,const Address &point) const;	///< Construct an Address given an offset
++  Address getAddress(uintb off,int4 sz,const Address &point,bool isResolved=false) const;	///< Construct an Address given an offset
+   virtual Datatype *getSubType(int8 off,int8 *newoff) const;
+   virtual int8 nearestArrayedComponentForward(int8 off,int8 max,int8 *newoff,int8 *elSize) const;
+   virtual int8 nearestArrayedComponentBackward(int8 off,int8 max,int8 *newoff,int8 *elSize) const;
 diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.cc
-index 51a0751b5d..4f288151a0 100644
+index a04614c5..42f8ee19 100644
 --- a/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.cc
 +++ b/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.cc
-@@ -519,6 +519,8 @@ void Varnode::copySymbol(const Varnode *vn)
- {
-   type = vn->type;		// Copy any type
+@@ -497,6 +497,7 @@ void Varnode::copySymbol(const Varnode *vn)
    mapentry = vn->mapentry;	// Copy any symbol
-+  addlflags = (addlflags & ~Varnode::resolved_pointer) |
-+    (vn->addlflags & Varnode::resolved_pointer);
    flags &= ~(Varnode::typelock | Varnode::namelock);
    flags |= (Varnode::typelock | Varnode::namelock) & vn->flags;
++  addlflags |= vn->addlflags & Varnode::resolved_pointer;
    if (high != (HighVariable *)0) {
+     high->typeDirty();
+     if (mapentry != (SymbolEntry *)0)
 diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.hh b/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.hh
+index b78368fc..5f714af5 100644
 --- a/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.hh
 +++ b/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.hh
 @@ -129,7 +129,8 @@ public:
@@ -298,23 +755,107 @@ diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/varnode.hh b/Ghidra/Fe
      stop_uppropagation = 0x800,	///< Data-types do not propagate from an output into \b this
 -    has_implied_field = 0x1000	///< The varnode is implied but also has a data-type that needs resolution
 +    has_implied_field = 0x1000,	///< The varnode is implied but also has a data-type that needs resolution
-+    resolved_pointer = 0x2000	///< Constant is already an offset in its target address space
++    resolved_pointer = 0x2000	///< Constant already resolved into its physical address space
    };
  private:
    mutable uint4 flags;		///< The collection of boolean attributes for this Varnode
-@@ -258,6 +259,7 @@ public:
-   bool isProtoPartial(void) const { return ((flags&Varnode::proto_partial)!=0); } ///< Is \b this getting pieced together into a larger whole
-   bool isPtrCheck(void) const { return ((addlflags&Varnode::ptrcheck)!=0); } ///< Has \b this been checked as a constant pointer to a mapped symbol?
-   bool isPtrFlow(void) const { return ((addlflags&Varnode::ptrflow)!=0); } ///< Does this varnode flow to or from a known pointer
-+  bool isResolvedPointer(void) const { return ((addlflags&Varnode::resolved_pointer)!=0); } ///< Is this a pointer constant already resolved to an address-space offset
-   bool isSpacebasePlaceholder(void) const { return ((addlflags&Varnode::spacebase_placeholder)!=0); } ///< Is \b this used specifically to track stackpointer values?
-   bool hasNoLocalAlias(void) const { return ((flags&Varnode::nolocalalias)!=0); } ///< Are there (not) any local pointers that might affect \b this?
-   bool isMark(void) const { return ((flags&Varnode::mark)!=0); } ///< Has \b this been visited by the current algorithm?
-@@ -316,6 +318,7 @@ public:
-   void clearPtrCheck(void) { addlflags &= ~Varnode::ptrcheck; } ///< Clear the pointer check mark on this Varnode
-   void setPtrFlow(void) { addlflags |= Varnode::ptrflow; } ///< Set \b this as flowing to or from pointer
-   void clearPtrFlow(void) { addlflags &= ~Varnode::ptrflow; } ///< Indicate that this varnode is not flowing to or from pointer
-+  void setResolvedPointer(void) { addlflags |= Varnode::resolved_pointer; } ///< Mark a pointer constant as already resolved to an address-space offset
-   void setSpacebasePlaceholder(void) { addlflags |= Varnode::spacebase_placeholder; } ///< Mark \b this as a special Varnode for tracking stackpointer values
-   void clearSpacebasePlaceholder(void) { addlflags &= ~Varnode::spacebase_placeholder; } ///< Clear the stackpointer tracking mark
-   void setPrecisLo(void) { setFlags(Varnode::precislo); } ///< Mark \b this as the low portion of a double precision value
+@@ -266,6 +267,7 @@ public:
+   bool isLockedInput(void) const { return ((addlflags&Varnode::locked_input)!=0); }	///< Is always an input, even if unused
+   bool stopsUpPropagation(void) const { return ((addlflags&Varnode::stop_uppropagation)!=0); }	///< Is data-type propagation stopped
+   bool hasImpliedField(void) const { return ((addlflags&Varnode::has_implied_field)!=0); }	///< Does \b this have an implied field
++  bool isResolvedPointer(void) const { return ((addlflags&Varnode::resolved_pointer)!=0); } ///< Is this an already resolved pointer constant
+ 
+   /// Is \b this just a special placeholder representing INDIRECT creation?
+   bool isIndirectZero(void) const { return ((flags&(Varnode::indirect_creation|Varnode::constant))==(Varnode::indirect_creation|Varnode::constant)); }
+@@ -333,6 +335,7 @@ public:
+   void setStopUpPropagation(void) { addlflags |= Varnode::stop_uppropagation; }	///< Stop up-propagation thru \b this
+   void clearStopUpPropagation(void) { addlflags &= ~Varnode::stop_uppropagation; }	///< Stop up-propagation thru \b this
+   void setImpliedField(void) { addlflags |= Varnode::has_implied_field; }	///< Mark \b this as having an implied field
++  void setResolvedPointer(void) { addlflags |= Varnode::resolved_pointer; } ///< Mark this pointer constant as already resolved
+   bool updateType(Datatype *ct);	///< Set the Datatype if not locked
+   bool updateType(Datatype *ct,bool lock,bool over); ///< (Possibly) set the Datatype given various restrictions
+   void setStackStore(void) { addlflags |= Varnode::stack_store; } ///< Mark as produced by explicit CPUI_STORE
+diff --git a/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/ClangVariableToken.java b/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/ClangVariableToken.java
+index 7c3f1b50..944e581b 100644
+--- a/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/ClangVariableToken.java
++++ b/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/ClangVariableToken.java
+@@ -17,6 +17,8 @@ package ghidra.app.decompiler;
+ 
+ import ghidra.program.model.address.Address;
+ import ghidra.program.model.address.AddressFactory;
++import ghidra.program.model.address.AddressOutOfBoundsException;
++import ghidra.program.model.address.AddressSpace;
+ import ghidra.program.model.data.AbstractIntegerDataType;
+ import ghidra.program.model.data.DataType;
+ import ghidra.program.model.pcode.*;
+@@ -30,6 +32,7 @@ import ghidra.program.model.scalar.Scalar;
+ public class ClangVariableToken extends ClangToken {
+ 	private Varnode varnode;
+ 	private PcodeOp op;
++	private Address resolvedAddress;
+ 
+ 	public ClangVariableToken(ClangNode par) {
+ 		super(par);
+@@ -47,6 +50,14 @@ public class ClangVariableToken extends ClangToken {
+ 		return op;
+ 	}
+ 
++	/**
++	 * Returns the physical address explicitly represented by this token, if present.
++	 * @return resolved physical address or null
++	 */
++	public Address getResolvedAddress() {
++		return resolvedAddress;
++	}
++
+ 	@Override
+ 	public Scalar getScalar() {
+ 		if (varnode == null) {
+@@ -145,6 +156,9 @@ public class ClangVariableToken extends ClangToken {
+ 
+ 	@Override
+ 	public void decode(Decoder decoder, PcodeFactory pfactory) throws DecoderException {
++		AddressSpace resolvedSpace = null;
++		long resolvedOffset = 0;
++		boolean hasResolvedOffset = false;
+ 		for (;;) {
+ 			int attribId = decoder.getNextAttributeId();
+ 			if (attribId == 0) {
+@@ -158,6 +172,21 @@ public class ClangVariableToken extends ClangToken {
+ 				int refid = (int) decoder.readUnsignedInteger();
+ 				op = pfactory.getOpRef(refid);
+ 			}
++			else if (attribId == AttributeId.ATTRIB_SPACE.id()) {
++				resolvedSpace = decoder.readSpace();
++			}
++			else if (attribId == AttributeId.ATTRIB_OFFSET.id()) {
++				resolvedOffset = decoder.readUnsignedInteger();
++				hasResolvedOffset = true;
++			}
++		}
++		if (resolvedSpace != null && hasResolvedOffset) {
++			try {
++				resolvedAddress = resolvedSpace.getAddress(resolvedOffset, true);
++			}
++			catch (AddressOutOfBoundsException e) {
++				resolvedAddress = null;
++			}
+ 		}
+ 		decoder.rewindAttributes();
+ 		super.decode(decoder, pfactory);
+diff --git a/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/component/DecompilerPanel.java b/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/component/DecompilerPanel.java
+index bb9c5eb7..834cf71b 100644
+--- a/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/component/DecompilerPanel.java
++++ b/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/component/DecompilerPanel.java
+@@ -869,6 +869,11 @@ public class DecompilerPanel extends JPanel implements FieldMouseListener, Field
+ 	}
+ 
+ 	private void tryGoToVarnode(ClangVariableToken token, boolean newWindow) {
++		Address resolvedAddress = token.getResolvedAddress();
++		if (resolvedAddress != null) {
++			controller.goToAddress(resolvedAddress, newWindow);
++			return;
++		}
+ 		Varnode vn = token.getVarnode();
+ 		if (vn == null) {
+ 			PcodeOp op = token.getPcodeOp();

@@ -4,8 +4,11 @@ A Ghidra fork with fixes for reverse engineering Siemens phones.
 
 ## Differences from stock Ghidra
 
-- Supports multiple `segmentop` definitions for one address space with different pointer sizes.
-- Preserves resolved segmented pointers instead of translating them twice, fixing far-pointer and string constants in decompiled code.
+- Converts typed `PAGE:OFFSET` joins into segmented far pointers.
+- Preserves physical addresses through p-code folding instead of decoding them twice.
+- Resolves far-pointer strings and symbols and makes their decompiler tokens navigate to the physical address.
+- Hides representation-only pointer casts and width conversions.
+- Activates these changes only for processor specifications with `farpointer="yes"`.
 
 ## Build
 
