@@ -4,11 +4,12 @@ A Ghidra fork with fixes for reverse engineering Siemens phones.
 
 ## Differences from stock Ghidra
 
-- Converts typed `PAGE:OFFSET` joins into segmented far pointers.
-- Preserves physical addresses through p-code folding instead of decoding them twice.
-- Resolves far-pointer strings and symbols and makes their decompiler tokens navigate to the physical address.
-- Hides representation-only pointer casts and width conversions.
-- Activates these changes only for processor specifications with `farpointer="yes"`.
+- Segmented far pointers for processor specifications with `farpointer="yes"`:
+  - Converts typed `PAGE:OFFSET` joins into far pointers.
+  - Preserves physical addresses through p-code folding.
+  - Resolves strings and symbols and makes decompiler tokens navigate to physical addresses.
+  - Hides representation-only pointer casts and width conversions.
+- [ARM5T false `BL` bug](https://siepatch.dev/docs/reverse-engineering/fixing-ghidra): disables standalone Thumb-1 `BL`/`BLX` halfwords on ARM5T so erased flash (`FF FF`) is not analyzed as calls. Complete 32-bit calls and ARM4T behavior are preserved.
 
 ## Build
 

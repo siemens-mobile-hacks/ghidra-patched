@@ -1,0 +1,22 @@
+diff --git a/Ghidra/Processors/ARM/data/languages/ARMTHUMBinstructions.sinc b/Ghidra/Processors/ARM/data/languages/ARMTHUMBinstructions.sinc
+index 1f6b9f8c..c1eef2e7 100644
+--- a/Ghidra/Processors/ARM/data/languages/ARMTHUMBinstructions.sinc
++++ b/Ghidra/Processors/ARM/data/languages/ARMTHUMBinstructions.sinc
+@@ -1490,6 +1490,7 @@ macro th_set_carry_for_asr(op1,shift_count) {
+ }
+ 
+ @ifndef VERSION_6T2
++@ifndef VERSION_5
+ 
+ :bl^ItCond "#"^off		is TMode=1 & ItCond & op11=0x1e & soffset11 [ off = inst_start + 4 + (soffset11 << 12); ]
+ {
+@@ -1533,7 +1534,8 @@ macro th_set_carry_for_asr(op1,shift_count) {
+   call [dest];
+ }
+ 
+-@endif
++@endif # VERSION_5
++@endif # VERSION_6T2
+ 
+ :bl^ItCond 	ThAddr24 			is TMode=1 & CALLoverride=1 & ItCond & (op11=0x1e; part2c1415=3 & part2c1212=1) & ThAddr24
+ {
