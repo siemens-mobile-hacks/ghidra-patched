@@ -1,8 +1,35 @@
 diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
-index f1664ac3..204075c5 100644
+index f1664ac3..1d3d7d74 100644
 --- a/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
 +++ b/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
-@@ -1213,6 +1213,23 @@ int4 ActionConstantPtr::apply(Funcdata &data)
+@@ -1075,7 +1075,25 @@ SymbolEntry *ActionConstantPtr::isPointer(AddrSpace *spc,Varnode *vn,PcodeOp *op
+   bool needexacthit;
+   Architecture *glb = data.getArch();
+   Varnode *outvn;
+-  if (vn->getTypeReadFacing(op)->getMetatype() == TYPE_PTR) { // Are we explicitly marked as a pointer
++  Datatype *readType = vn->getTypeReadFacing(op);
++  if (readType->getMetatype() == TYPE_PTR) { // Are we explicitly marked as a pointer
++    TypePointer *pointerType = (TypePointer *)readType;
++    // ArchitectureGhidra uses "ghidra" as archid for every client-backed
++    // language.  These two spec-native identifiers select the C166 processor
++    // and its TASKING Classic large compiler model respectively.
++    bool isC166TaskingClassicLarge =
++	glb->userops.getOp("GetPagedOffset") != (UserPcodeOp *)0 &&
++	glb->hasModel("__tasking_c166_classic");
++    if (isC166TaskingClassicLarge &&
++	pointerType->getPtrTo()->getMetatype() == TYPE_CODE) {
++      // TASKING Classic code pointers are already encoded as SEGMENT:OFFSET.
++      // Its SegmentOp on the shared code/data space describes PAGE:OFFSET data
++      // pointers and must not be applied here.  Leave the raw constant in
++      // place; PrintC resolves TYPE_CODE constants in the default code space.
++      uintb codeOffset = AddrSpace::addressToByte(vn->getOffset(),spc->getWordSize());
++      if (codeOffset <= spc->getHighest())
++	return (SymbolEntry *)0;
++    }
+     rampoint = glb->resolveConstant(spc,vn->getOffset(),vn->getSize(),op->getAddr(),fullEncoding);
+     needexacthit = false;
+   }
+@@ -1213,6 +1231,23 @@ int4 ActionConstantPtr::apply(Funcdata &data)
  	data.opSwapInput(op,0,1);
        count += 1;
      }
@@ -26,7 +53,7 @@ index f1664ac3..204075c5 100644
    }
    return 0;
  }
-@@ -5337,7 +5354,8 @@ void ActionInferTypes::propagateSpacebaseRef(Funcdata &data,Varnode *spcvn)
+@@ -5337,7 +5372,8 @@ void ActionInferTypes::propagateSpacebaseRef(Funcdata &data,Varnode *spcvn)
      case CPUI_PTRSUB:
        vn = op->getIn(1);
        if (vn->isConstant()) {
@@ -36,7 +63,7 @@ index f1664ac3..204075c5 100644
  	propagateRef(data,op->getOut(),addr);
        }
        break;
-@@ -5688,6 +5706,7 @@ void ActionDatabase::universalAction(Architecture *conf)
+@@ -5688,6 +5724,7 @@ void ActionDatabase::universalAction(Architecture *conf)
  	actprop->addRule( new RuleInt2FloatCollapse("analysis") );
  	actprop->addRule( new RulePtraddUndo("typerecovery") );
  	actprop->addRule( new RulePtrsubUndo("typerecovery") );

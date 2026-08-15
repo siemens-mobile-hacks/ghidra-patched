@@ -9,6 +9,13 @@ A Ghidra fork with fixes for reverse engineering Siemens phones.
   - Preserves physical addresses through p-code folding.
   - Resolves strings and symbols and makes decompiler tokens navigate to physical addresses.
   - Hides representation-only pointer casts and width conversions.
+  - Distinguishes TASKING Classic C166 function pointers from data pointers:
+    pointers to a Function Definition retain their raw 24-bit
+    `SEGMENT:OFFSET` value, while ordinary pointers continue to use the C166
+    `PAGE:OFFSET` calculation.
+  - Scopes that distinction to processor specifications exposing
+    `GetPagedOffset` together with the `__tasking_c166_classic` compiler model;
+    other processor and compiler models keep the stock behavior.
 - [ARM5T false `BL` bug](https://siepatch.dev/docs/reverse-engineering/fixing-ghidra): disables standalone Thumb-1 `BL`/`BLX` halfwords on ARM5T so erased flash (`FF FF`) is not analyzed as calls. Complete 32-bit calls and ARM4T behavior are preserved.
 
 ## Build
