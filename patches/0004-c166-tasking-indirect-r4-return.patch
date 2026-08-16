@@ -1,0 +1,165 @@
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.cc
+index d87eb2f9..d45b61e1 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.cc
+@@ -3869,6 +3869,24 @@ void FuncProto::getPieces(PrototypePieces &pieces) const
+   pieces.firstVarArgSlot = isDotdotdot() ? num : -1;
+ }
+ 
++/// \brief Get the logical return value data-type
++///
++/// TASKING C166 Classic returns doubles and structures through a near pointer
++/// in R4 without receiving a hidden return pointer.  The physical prototype
++/// therefore carries an indirect pointer, while the source-level return type is
++/// the pointed-to type.  The Java protocol encoder only transmits indirect
++/// return storage for the C166 TASKING Classic large model, so the flag itself
++/// is the architecture-scoped contract.
++Datatype *FuncProto::getOutputType(void) const
++
++{
++  ProtoParameter *outparam = store->getOutput();
++  Datatype *type = outparam->getType();
++  if (!outparam->isIndirectStorage() || type->getMetatype() != TYPE_PTR)
++    return type;
++  return ((TypePointer *)type)->getPtrTo();
++}
++
+ /// Input parameters are set based on an existing function Scope
+ /// and if there is no prototype model the default model is set.
+ /// Parameters that are added to \b this during analysis will automatically
+@@ -4651,8 +4669,10 @@ void FuncProto::encode(Encoder &encoder) const
+   encoder.openElement(ELEM_RETURNSYM);
+   if (outparam->isTypeLocked())
+     encoder.writeBool(ATTRIB_TYPELOCK, true);
++  if (outparam->isIndirectStorage())
++    encoder.writeBool(ATTRIB_INDIRECTSTORAGE, true);
+   outparam->getAddress().encode(encoder,outparam->getSize());
+-  outparam->getType()->encodeRef(encoder);
++  getOutputType()->encodeRef(encoder);
+   encoder.closeElement(ELEM_RETURNSYM);
+   encodeEffect(encoder);
+   encodeLikelyTrash(encoder);
+@@ -4742,6 +4762,7 @@ void FuncProto::decode(Decoder &decoder,Architecture *glb)
+   uint4 subId = decoder.peekElement();
+   if (subId != 0) {
+     ParameterPieces outpieces;
++    outpieces.flags = 0;
+     bool outputlock = false;
+ 
+     if (subId == ELEM_RETURNSYM) {
+@@ -4751,11 +4772,14 @@ void FuncProto::decode(Decoder &decoder,Architecture *glb)
+ 	if (attribId == 0) break;
+ 	if (attribId == ATTRIB_TYPELOCK)
+ 	  outputlock = decoder.readBool();
++	else if (attribId == ATTRIB_INDIRECTSTORAGE) {
++	  if (decoder.readBool())
++	    outpieces.flags |= ParameterPieces::indirectstorage;
++	}
+       }
+       int4 tmpsize;
+       outpieces.addr = Address::decode(decoder,tmpsize);
+       outpieces.type = glb->types->decodeType(decoder);
+-      outpieces.flags = 0;
+       decoder.closeElement(subId);
+     }
+     else if (subId == ELEM_ADDR) { // Old-style specification of return (supported partially for backward compat)
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.hh b/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.hh
+index 6d1615b4..3cea33c0 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.hh
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.hh
+@@ -1535,7 +1535,7 @@ public:
+   int4 numParams(void) const { return store->getNumInputs(); }	///< Get the number of input parameters
+   ProtoParameter *getOutput(void) const { return store->getOutput(); }	///< Get the return value
+   void setOutput(const ParameterPieces &piece) { store->setOutput(piece); }	///< Set return value storage directly
+-  Datatype *getOutputType(void) const { return store->getOutput()->getType(); }	///< Get the return value data-type
++  Datatype *getOutputType(void) const;	///< Get the logical return value data-type
+   const RangeList &getLocalRange(void) const { return model->getLocalRange(); }	///< Get the range of potential local stack variables
+   const RangeList &getParamRange(void) const { return model->getParamRange(); }	///< Get the range of potential stack parameters
+   bool isStackGrowsNegative(void) const { return model->isStackGrowsNegative(); }	///< Return \b true if the stack grows toward smaller addresses
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc
+index 53fd6899..cb90d5f4 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc
+@@ -780,6 +780,14 @@ void PrintC::opReturn(const PcodeOp *op)
+     emit->tagOp(KEYWORD_RETURN,EmitMarkup::keyword_color,op);
+     if (op->numInput()>1) {
+       emit->spaces(1);
++	  const FuncProto &proto(op->getParent()->getFuncdata()->getFuncProto());
++	  ProtoParameter *outparam = proto.getOutput();
++	  if (outparam->isIndirectStorage() &&
++	      proto.getOutputType() != outparam->getType()) {
++	    pushOp(&dereference,op);
++	    pushOp(&typecast,op);
++	    pushType(outparam->getType());
++	  }
+       pushVn(op->getIn(1),op,mods);
+     }
+     return;
+diff --git a/Ghidra/Framework/SoftwareModeling/src/main/java/ghidra/program/model/pcode/FunctionPrototype.java b/Ghidra/Framework/SoftwareModeling/src/main/java/ghidra/program/model/pcode/FunctionPrototype.java
+index e7c84c2e..715cf36e 100644
+--- a/Ghidra/Framework/SoftwareModeling/src/main/java/ghidra/program/model/pcode/FunctionPrototype.java
++++ b/Ghidra/Framework/SoftwareModeling/src/main/java/ghidra/program/model/pcode/FunctionPrototype.java
+@@ -25,6 +25,7 @@ import ghidra.program.model.lang.*;
+ import ghidra.program.model.listing.*;
+ import ghidra.program.model.symbol.SourceType;
+ import ghidra.util.Msg;
++import ghidra.util.exception.InvalidInputException;
+ 
+ /**
+  * 
+@@ -352,6 +353,10 @@ public class FunctionPrototype {
+ 		if (outputlock) {
+ 			encoder.writeBool(ATTRIB_TYPELOCK, outputlock);
+ 		}
++		if (returnstorage != null && returnstorage.isForcedIndirect() &&
++			isC166TaskingClassicLarge(dtmanage.getProgram())) {
++			encoder.writeBool(ATTRIB_INDIRECTSTORAGE, true);
++		}
+ 		int sz = returntype.getLength();
+ 		if (sz < 0) {
+ 			Msg.warn(this, "Bad returntype size");
+@@ -409,6 +414,12 @@ public class FunctionPrototype {
+ 		encoder.closeElement(ELEM_PROTOTYPE);
+ 	}
+ 
++	private static boolean isC166TaskingClassicLarge(Program program) {
++		return program.getLanguage().getLanguageID().getIdAsString().startsWith("C166:") &&
++			"tasking-classic-large".equals(
++				program.getCompilerSpec().getCompilerSpecID().getIdAsString());
++	}
++
+ 	/**
+ 	 * Decode the function prototype from a {@code <prototype>} element in the stream.
+ 	 * @param decoder is the stream decoder
+@@ -465,6 +476,7 @@ public class FunctionPrototype {
+ 		}
+ 		int retel = decoder.openElement(ELEM_RETURNSYM);
+ 		outputlock = false;
++		boolean indirectStorage = false;
+ 		for (;;) {
+ 			int attribId = decoder.getNextAttributeId();
+ 			if (attribId == 0) {
+@@ -473,11 +485,23 @@ public class FunctionPrototype {
+ 			if (attribId == ATTRIB_TYPELOCK.id()) {
+ 				outputlock = decoder.readBool();
+ 			}
++			else if (attribId == ATTRIB_INDIRECTSTORAGE.id()) {
++				indirectStorage = decoder.readBool();
++			}
+ 		}
+ 
+ 		int addrel = decoder.openElement(ELEM_ADDR);
+ 		returnstorage = AddressXML.decodeStorageFromAttributes(-1, decoder, pcodeFactory);
+ 		decoder.closeElement(addrel);
++		if (indirectStorage && isC166TaskingClassicLarge(dtmanage.getProgram())) {
++			try {
++				returnstorage = new DynamicVariableStorage(dtmanage.getProgram(), true,
++					returnstorage.getVarnodes());
++			}
++			catch (InvalidInputException e) {
++				throw new DecoderException("Invalid indirect return storage");
++			}
++		}
+ 		returntype = dtmanage.decodeDataType(decoder);
+ 		decoder.closeElement(retel);
+ 
