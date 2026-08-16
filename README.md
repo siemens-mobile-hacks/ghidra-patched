@@ -17,6 +17,7 @@ A Ghidra fork with fixes for reverse engineering Siemens phones.
     `GetPagedOffset` together with the `__tasking_c166_classic` compiler model;
     other processor and compiler models keep the stock behavior.
 - [ARM5T false `BL` bug](https://siepatch.dev/docs/reverse-engineering/fixing-ghidra): disables standalone Thumb-1 `BL`/`BLX` halfwords on ARM5T so erased flash (`FF FF`) is not analyzed as calls. Complete 32-bit calls and ARM4T behavior are preserved.
+- Preserves automatic hidden-return metadata for multipart pointers in the C166 TASKING Classic large model.
 
 ## Build
 
