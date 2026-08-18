@@ -2,15 +2,14 @@ diff --git a/Ghidra/Framework/SoftwareModeling/src/main/java/ghidra/program/mode
 index acb81df9..ed9bc5f3 100644
 --- a/Ghidra/Framework/SoftwareModeling/src/main/java/ghidra/program/model/lang/ParameterPieces.java
 +++ b/Ghidra/Framework/SoftwareModeling/src/main/java/ghidra/program/model/lang/ParameterPieces.java
-@@ -87,7 +87,17 @@ public class ParameterPieces {
+@@ -87,7 +87,16 @@ public class ParameterPieces {
  		VariableStorage store;
  		try {
  			if (joinPieces != null) {
 -				store = new DynamicVariableStorage(program, isIndirect, joinPieces);
 +				boolean isC166TaskingClassicLarge = hiddenReturnPtr &&
-+					program.getLanguage().getLanguageID().getIdAsString().startsWith("C166:") &&
 +					"tasking-classic-large".equals(
-+						program.getCompilerSpec().getCompilerSpecID().getIdAsString());
++						program.getLanguage().getProperty("c166.abi"));
 +				if (isC166TaskingClassicLarge) {
 +					store = new DynamicVariableStorage(program,
 +						AutoParameterType.RETURN_STORAGE_PTR, joinPieces);

@@ -26,6 +26,8 @@ git -C "${source_dir}" clean -fd
 git -C "${source_dir}" clean -fdX -- \
 	Ghidra/Features/Decompiler/src/decompile/cpp/test_dbg \
 	Ghidra/Features/Decompiler/src/decompile/cpp/decomp_test_dbg \
+	Ghidra/Features/Decompiler/src/decompile/cpp/decomp_dbg \
+	Ghidra/Features/Decompiler/src/decompile/cpp/com_dbg \
 	Ghidra/Features/Decompiler/src/decompile/cpp/ghi_opt \
 	Ghidra/Features/Decompiler/src/decompile/cpp/ghidra_opt
 

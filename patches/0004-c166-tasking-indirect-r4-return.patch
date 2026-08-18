@@ -118,20 +118,19 @@ index e7c84c2e..715cf36e 100644
  		int sz = returntype.getLength();
  		if (sz < 0) {
  			Msg.warn(this, "Bad returntype size");
-@@ -409,6 +414,12 @@ public class FunctionPrototype {
+@@ -409,6 +414,11 @@ public class FunctionPrototype {
  		encoder.closeElement(ELEM_PROTOTYPE);
  	}
  
 +	private static boolean isC166TaskingClassicLarge(Program program) {
-+		return program.getLanguage().getLanguageID().getIdAsString().startsWith("C166:") &&
-+			"tasking-classic-large".equals(
-+				program.getCompilerSpec().getCompilerSpecID().getIdAsString());
++		return "tasking-classic-large".equals(
++			program.getLanguage().getProperty("c166.abi"));
 +	}
 +
  	/**
  	 * Decode the function prototype from a {@code <prototype>} element in the stream.
  	 * @param decoder is the stream decoder
-@@ -465,6 +476,7 @@ public class FunctionPrototype {
+@@ -465,6 +475,7 @@ public class FunctionPrototype {
  		}
  		int retel = decoder.openElement(ELEM_RETURNSYM);
  		outputlock = false;
@@ -139,7 +138,7 @@ index e7c84c2e..715cf36e 100644
  		for (;;) {
  			int attribId = decoder.getNextAttributeId();
  			if (attribId == 0) {
-@@ -473,11 +485,23 @@ public class FunctionPrototype {
+@@ -473,11 +484,23 @@ public class FunctionPrototype {
  			if (attribId == ATTRIB_TYPELOCK.id()) {
  				outputlock = decoder.readBool();
  			}

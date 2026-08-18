@@ -13,12 +13,19 @@ A Ghidra fork with fixes for reverse engineering Siemens phones.
     pointers to a Function Definition retain their raw 24-bit
     `SEGMENT:OFFSET` value, while ordinary pointers continue to use the C166
     `PAGE:OFFSET` calculation.
-  - Scopes that distinction to processor specifications exposing
-    `GetPagedOffset` together with the `__tasking_c166_classic` compiler model;
-    other processor and compiler models keep the stock behavior.
+  - Scopes all C166-specific far-pointer behavior to processor specifications
+    declaring the exact `c166.abi=tasking-classic-large` property; other
+    processor and compiler models keep the stock behavior.
+  - Hides representation-only masks and casts when a TASKING far pointer is
+    formed from an R0-relative user-stack address.
+- Extends Auto Structure for TASKING Classic Large far-data pointers, including
+  split PAGE:OFFSET globals and indexed array elements, and retypes the actual
+  four-byte global pointer instead of a selected 16-bit index variable.
 - [ARM5T false `BL` bug](https://siepatch.dev/docs/reverse-engineering/fixing-ghidra): disables standalone Thumb-1 `BL`/`BLX` halfwords on ARM5T so erased flash (`FF FF`) is not analyzed as calls. Complete 32-bit calls and ARM4T behavior are preserved.
 - Preserves automatic hidden-return metadata for multipart pointers in the C166 TASKING Classic large model.
-- Preserves TASKING C166 Classic Large indirect R4 returns as logical `double` or aggregate values without adding a hidden return parameter; the protocol change is gated by C166 `LanguageID` and the `tasking-classic-large` compiler spec.
+- Preserves TASKING C166 Classic Large indirect R4 returns as logical `double`
+  or aggregate values without adding a hidden return parameter; the protocol
+  change is gated by the exact processor-spec ABI property.
 
 ## Build
 

@@ -1,0 +1,178 @@
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/architecture.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/architecture.cc
+index 97c33cd9..015d61e6 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/architecture.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/architecture.cc
+@@ -1224,8 +1224,19 @@ void Architecture::parseProcessorConfig(DocumentStorage &store)
+       decoder.closeElementSkipping(subId);
+     }
+     else if (subId == ELEM_PROPERTIES) {
+-      decoder.openElement();
+-      decoder.closeElementSkipping(subId);
++      uint4 propertiesId = decoder.openElement();
++      for(;;) {
++	uint4 propertyId = decoder.peekElement();
++	if (propertyId == 0) break;
++	if (propertyId != ELEM_PROPERTY)
++	  throw LowlevelError("Unknown element in <properties>");
++	decoder.openElement();
++	string key = decoder.readString(ATTRIB_KEY);
++	string value = decoder.readString(ATTRIB_VALUE);
++	processorProperties[key] = value;
++	decoder.closeElement(propertyId);
++      }
++      decoder.closeElement(propertiesId);
+     }
+     else
+       throw LowlevelError("Unknown element in <processor_spec>");
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/architecture.hh b/Ghidra/Features/Decompiler/src/decompile/cpp/architecture.hh
+index ebd0e843..2c3c141a 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/architecture.hh
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/architecture.hh
+@@ -180,6 +180,7 @@ public:
+   bool nan_ignore_all;		///< True if we should ignore NaN operations, i.e. nan() always returns false
+   bool nan_ignore_compare;	///< True if we should ignore NaN operations protecting floating-point comparisons
+   vector<AddrSpace *> inferPtrSpaces;	///< Set of address spaces in which a pointer constant is inferable
++  map<string,string> processorProperties; ///< Properties declared by the processor specification
+   int4 funcptr_align;		///< How many bits of alignment a function ptr has
+   uint4 flowoptions;            ///< options passed to flow following engine
+   uint4 max_instructions;	///< Maximum instructions that can be processed in one function
+@@ -223,6 +224,10 @@ public:
+   void resetDefaults(void);		///< Reset defaults values for options owned by \b this
+   ProtoModel *getModel(const string &nm) const;		///< Get a specific PrototypeModel
+   bool hasModel(const string &nm) const;		///< Does this Architecture have a specific PrototypeModel
++  bool hasProcessorProperty(const string &key,const string &value) const {
++    map<string,string>::const_iterator iter = processorProperties.find(key);
++    return iter != processorProperties.end() && iter->second == value;
++  } ///< Does the processor specification declare an exact key/value pair
+   ProtoModel *createUnknownModel(const string &modelName);	///< Create a model for an unrecognized name
+   bool highPtrPossible(const Address &loc,int4 size) const; ///< Are pointers possible to the given location?
+   AddrSpace *getSpaceBySpacebase(const Address &loc,int4 size) const; ///< Get space associated with a \e spacebase register
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
+index 1d3d7d74..629be9a2 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
+@@ -1079,11 +1079,10 @@ SymbolEntry *ActionConstantPtr::isPointer(AddrSpace *spc,Varnode *vn,PcodeOp *op
+   if (readType->getMetatype() == TYPE_PTR) { // Are we explicitly marked as a pointer
+     TypePointer *pointerType = (TypePointer *)readType;
+     // ArchitectureGhidra uses "ghidra" as archid for every client-backed
+-    // language.  These two spec-native identifiers select the C166 processor
+-    // and its TASKING Classic large compiler model respectively.
++    // language.  The C166 module's large-model processor specs provide these
++    // explicit processor and compiler identifiers instead.
+     bool isC166TaskingClassicLarge =
+-	glb->userops.getOp("GetPagedOffset") != (UserPcodeOp *)0 &&
+-	glb->hasModel("__tasking_c166_classic");
++	glb->hasProcessorProperty("c166.abi","tasking-classic-large");
+     if (isC166TaskingClassicLarge &&
+ 	pointerType->getPtrTo()->getMetatype() == TYPE_CODE) {
+       // TASKING Classic code pointers are already encoded as SEGMENT:OFFSET.
+@@ -1237,7 +1236,8 @@ int4 ActionConstantPtr::apply(Funcdata &data)
+       if (ptrspc == (AddrSpace *)0)
+ 	ptrspc = glb->getDefaultDataSpace();
+       SegmentOp *segdef = glb->userops.getSegmentOp(ptrspc->getIndex());
+-      if (segdef != (SegmentOp *)0 && segdef->hasFarPointerSupport() &&
++      if (glb->hasProcessorProperty("c166.abi","tasking-classic-large") &&
++	  segdef != (SegmentOp *)0 && segdef->hasFarPointerSupport() &&
+ 	  vn->getSize() > segdef->getInnerSize()) {
+ 	uintb val = AddrSpace::byteToAddress(rampoint.getOffset(),ptrspc->getWordSize());
+ 	Varnode *newvn = data.newConstant(vn->getSize(),val);
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc
+index cb90d5f4..c0a077e1 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc
+@@ -815,6 +815,45 @@ void PrintC::opCast(const PcodeOp *op)
+ {
+   Datatype *outtype = op->getOut()->getHighTypeDefFacing();
+   const Varnode *invn = op->getIn(0);
++  if (outtype->getMetatype() == TYPE_PTR &&
++      glb->hasProcessorProperty("c166.abi","tasking-classic-large") &&
++      invn->isWritten() && invn->getDef()->code() == CPUI_INT_AND) {
++    const PcodeOp *andOp = invn->getDef();
++    AddrSpace *spc = glb->getDefaultDataSpace();
++    SegmentOp *segdef = glb->getSegmentOp(spc);
++    uintb farOffsetMask = 0;
++    if (segdef != (SegmentOp *)0 && segdef->hasFarPointerSupport() &&
++	segdef->getBaseSize() + segdef->getInnerSize() == op->getOut()->getSize()) {
++      farOffsetMask = (calc_mask(segdef->getBaseSize()) <<
++	  (8 * segdef->getInnerSize())) |
++	  (calc_mask(segdef->getInnerSize()) >> 2);
++    }
++    if (farOffsetMask != 0 && andOp->getIn(1)->isConstant() &&
++	andOp->getIn(1)->getOffset() == farOffsetMask &&
++	andOp->getIn(0)->isWritten() && andOp->getIn(0)->getDef()->code() == CPUI_CAST) {
++      const Varnode *segmented = andOp->getIn(0)->getDef()->getIn(0);
++      if (segmented->isWritten() && segmented->getDef()->code() == CPUI_SEGMENTOP) {
++	const PcodeOp *segmentOp = segmented->getDef();
++	const Varnode *nearPointer = segmentOp->getIn(2);
++	if (nearPointer->isWritten() && nearPointer->getDef()->code() == CPUI_PTRSUB) {
++	  const Varnode *base = nearPointer->getDef()->getIn(0);
++	  AddrSpace *stackSpace = glb->getStackSpace();
++	  if (stackSpace != (AddrSpace *)0 && stackSpace->numSpacebase() != 0) {
++	    const VarnodeData &stackPointer = stackSpace->getSpacebase(0);
++	    if (base->getSize() == stackPointer.size &&
++		base->getAddr() == stackPointer.getAddr()) {
++	      // TASKING emitted PAGE:(R0 & 0x3fff).  SEGMENTOP already
++	      // captures PAGE:OFFSET, so print the recovered stack address and
++	      // suppress only the representation-level casts and mask.
++	      pushOp(&hidden,op);
++	      pushVn(segmented,op,mods);
++	      return;
++	    }
++	  }
++	}
++      }
++    }
++  }
+   if (outtype->getMetatype() == TYPE_PTR && invn->isWritten() &&
+ 	invn->getDef()->code() == CPUI_INT_ZEXT) {
+     const PcodeOp *zextop = invn->getDef();
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
+index 204abd17..87317a6e 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
+@@ -20,6 +20,29 @@
+ 
+ namespace ghidra {
+ 
++/// Return the segmented data-space definition only for the C166 TASKING Classic
++/// large model.  ArchitectureGhidra reports a generic architecture id, so the
++/// module's large-model processor specs provide explicit processor and compiler
++/// identifiers as properties.
++static SegmentOp *getC166TaskingClassicLargeSegment(Funcdata &data,Datatype *type)
++
++{
++  Architecture *glb = data.getArch();
++  if (!glb->hasProcessorProperty("c166.abi","tasking-classic-large") ||
++      type == (Datatype *)0 ||
++      type->getMetatype() != TYPE_PTR)
++    return (SegmentOp *)0;
++  TypePointer *pointerType = (TypePointer *)type;
++  AddrSpace *spc = pointerType->getSpace();
++  if (spc == (AddrSpace *)0)
++    spc = glb->getDefaultDataSpace();
++  SegmentOp *segdef = glb->userops.getSegmentOp(spc->getIndex());
++  if (segdef == (SegmentOp *)0 || !segdef->hasFarPointerSupport() ||
++      type->getSize() != segdef->getBaseSize() + segdef->getInnerSize())
++    return (SegmentOp *)0;
++  return segdef;
++}
++
+ /// \class RuleEarlyRemoval
+ /// \brief Get rid of unused PcodeOp objects where we can guarantee the output is unused
+ int4 RuleEarlyRemoval::applyOp(PcodeOp *op,Funcdata &data)
+@@ -9028,13 +9051,12 @@ int4 RulePieceFarPointer::applyOp(PcodeOp *op,Funcdata &data)
+ {
+   Varnode *outvn = op->getOut();
+   Datatype *outtype = outvn->getTypeDefFacing();
+-  if (outtype->getMetatype() != TYPE_PTR) return 0;
++  SegmentOp *segdef = getC166TaskingClassicLargeSegment(data,outtype);
++  if (segdef == (SegmentOp *)0) return 0;
+   TypePointer *ptrtype = (TypePointer *)outtype;
+   AddrSpace *spc = ptrtype->getSpace();
+   if (spc == (AddrSpace *)0)
+     spc = data.getArch()->getDefaultDataSpace();
+-  SegmentOp *segdef = data.getArch()->userops.getSegmentOp(spc->getIndex());
+-  if (segdef == (SegmentOp *)0 || !segdef->hasFarPointerSupport()) return 0;
+   if (op->getIn(0)->getSize() != segdef->getBaseSize()) return 0;
+   if (op->getIn(1)->getSize() != segdef->getInnerSize()) return 0;
+   if (outvn->getSize() != segdef->getBaseSize() + segdef->getInnerSize()) return 0;

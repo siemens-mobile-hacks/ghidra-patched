@@ -1,0 +1,654 @@
+diff --git a/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/util/FillOutStructureCmd.java b/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/util/FillOutStructureCmd.java
+index ba83d772..aa5bed39 100644
+--- a/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/util/FillOutStructureCmd.java
++++ b/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/util/FillOutStructureCmd.java
+@@ -23,10 +23,12 @@ import ghidra.framework.cmd.BackgroundCommand;
+ import ghidra.framework.plugintool.ServiceProvider;
+ import ghidra.program.model.address.Address;
+ import ghidra.program.model.data.*;
++import ghidra.program.model.listing.Data;
+ import ghidra.program.model.listing.Function;
+ import ghidra.program.model.listing.Program;
+ import ghidra.program.model.pcode.*;
+ import ghidra.program.model.symbol.SourceType;
++import ghidra.program.model.util.CodeUnitInsertionException;
+ import ghidra.program.util.*;
+ import ghidra.util.Msg;
+ import ghidra.util.exception.*;
+@@ -40,6 +42,14 @@ import ghidra.util.task.TaskMonitor;
+  *
+  */
+ public class FillOutStructureCmd extends BackgroundCommand<Program> {
++	private static final String C166_ABI_PROPERTY = "c166.abi";
++	private static final String C166_TASKING_CLASSIC_LARGE = "tasking-classic-large";
++
++	private static class C166VariableRetypeRollbackException extends RollbackException {
++		C166VariableRetypeRollbackException(String message, Throwable cause) {
++			super(message, cause);
++		}
++	}
+ 
+ 	private DecompileOptions decompileOptions;
+ 	private ProgramLocation location;
+@@ -78,6 +88,7 @@ public class FillOutStructureCmd extends BackgroundCommand<Program> {
+ 		DecompInterface decompInterface = fillStructureHelper.setUpDecompiler(decompileOptions);
+ 		try {
+ 			HighVariable var = null;
++			Address c166GlobalPointerAddress = null;
+ 
+ 			if (!(location instanceof DecompilerLocation dloc)) {
+ 				// if we don't have one, make one, and map variable to a varnode
+@@ -96,8 +107,25 @@ public class FillOutStructureCmd extends BackgroundCommand<Program> {
+ 
+ 				var = token.getHighVariable();
+ 				Varnode exactSpot = token.getVarnode();
++				boolean c166IndexedGlobal = false;
++
++				if (isC166TaskingClassicLarge(program)) {
++					// Search the unsplit HighVariable first.  Different tokens for one loop
++					// index can refer to different SSA instances (initial value, phi,
++					// increment, comparison, or scaled use).  Splitting the selected token
++					// first loses the other instances and makes the result depend on where
++					// the user clicked.
++					HighVariable base =
++						fillStructureHelper.findC166IndexedFarPointerBase(var, exactSpot);
++					if (base != null) {
++						var = base;
++						c166GlobalPointerAddress =
++							fillStructureHelper.getC166SplitGlobalPointerAddress(var);
++						c166IndexedGlobal = c166GlobalPointerAddress != null;
++					}
++				}
+ 
+-				if ((var != null) && (exactSpot != null)) {
++				if (!c166IndexedGlobal && (var != null) && (exactSpot != null)) {
+ 					HighFunction hfunc = var.getHighFunction();
+ 					try { // Adjust HighVariable based on exact varnode selected, if there are merged groups
+ 						var = hfunc.splitOutMergeGroup(var, exactSpot);
+@@ -107,6 +135,11 @@ public class FillOutStructureCmd extends BackgroundCommand<Program> {
+ 						return false;
+ 					}
+ 				}
++
++				if (!c166IndexedGlobal && isC166TaskingClassicLarge(program)) {
++					c166GlobalPointerAddress =
++						fillStructureHelper.getC166SplitGlobalPointerAddress(var);
++				}
+ 			}
+ 
+ 			Structure structDT =
+@@ -124,11 +157,14 @@ public class FillOutStructureCmd extends BackgroundCommand<Program> {
+ 
+ 			boolean isThisParam = DecompilerUtils.isThisParameter(var, function);
+ 			if (!isThisParam) {
+-				commitVariable(var, pointerDT, isThisParam);
++				commitVariable(var, pointerDT, isThisParam, c166GlobalPointerAddress);
+ 			}
+ 
+ 			return true;
+ 		}
++		catch (C166VariableRetypeRollbackException e) {
++			throw e;
++		}
+ 		catch (Exception e) {
+ 			Msg.showError(this, null, "Auto Create Structure Failed",
+ 				"Failed to create Structure variable", e);
+@@ -145,9 +181,14 @@ public class FillOutStructureCmd extends BackgroundCommand<Program> {
+ 	 * @param newDt is the data-type
+ 	 * @param isThisParam is true if the variable is a 'this' pointer
+ 	 */
+-	private void commitVariable(HighVariable var, DataType newDt, boolean isThisParam) {
++	private void commitVariable(HighVariable var, DataType newDt, boolean isThisParam,
++			Address c166GlobalPointerAddress) {
+ 		if (!isThisParam) {
+ 			try {
++				if (c166GlobalPointerAddress != null) {
++					commitC166GlobalPointer(c166GlobalPointerAddress, newDt);
++					return;
++				}
+ 				HighFunctionDBUtil.updateDBVariable(var.getSymbol(), null, newDt,
+ 					SourceType.USER_DEFINED);
+ 			}
+@@ -155,12 +196,44 @@ public class FillOutStructureCmd extends BackgroundCommand<Program> {
+ 				throw new AssertException("Unexpected exception", e);
+ 			}
+ 			catch (InvalidInputException e) {
++				if (isC166TaskingClassicLarge(location.getProgram())) {
++					String message = "Failed to re-type variable " + var.getName() + ": " +
++						e.getMessage();
++					setStatusMsg(message);
++					throw new C166VariableRetypeRollbackException(message, e);
++				}
+ 				Msg.error(this,
+ 					"Failed to re-type variable " + var.getName() + ": " + e.getMessage());
+ 			}
+ 		}
+ 	}
+ 
++	private void commitC166GlobalPointer(Address address, DataType dataType)
++			throws InvalidInputException {
++		Program program = location.getProgram();
++		Data existing = program.getListing().getDefinedDataAt(address);
++		if (!(dataType instanceof Pointer) || dataType.getLength() != 4 || existing == null ||
++			!(existing.getDataType() instanceof Pointer) || existing.getLength() != 4) {
++			throw new InvalidInputException(
++				"C166 global far pointer is not defined at " + address);
++		}
++		try {
++			// The analyzer has already removed any false code and established the
++			// exact four-byte pointer object.  This command only changes its target
++			// type to the newly recovered structure.
++			DataUtilities.createData(program, address, dataType, dataType.getLength(), false,
++				DataUtilities.ClearDataMode.CLEAR_ALL_CONFLICT_DATA);
++		}
++		catch (CodeUnitInsertionException e) {
++			throw new InvalidInputException(e.getMessage());
++		}
++	}
++
++	private boolean isC166TaskingClassicLarge(Program program) {
++		return C166_TASKING_CLASSIC_LARGE.equals(
++			program.getLanguage().getProperty(C166_ABI_PROPERTY));
++	}
++
+ 	/**
+ 	 * Compute the storage address associated with a particular Location
+ 	 * @param function is the function owning the location
+diff --git a/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/util/FillOutStructureHelper.java b/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/util/FillOutStructureHelper.java
+index 136c3833..679a3524 100644
+--- a/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/util/FillOutStructureHelper.java
++++ b/Ghidra/Features/Decompiler/src/main/java/ghidra/app/decompiler/util/FillOutStructureHelper.java
+@@ -22,6 +22,7 @@ import ghidra.app.cmd.label.RenameLabelCmd;
+ import ghidra.app.decompiler.*;
+ import ghidra.app.decompiler.component.DecompilerUtils;
+ import ghidra.program.model.address.Address;
++import ghidra.program.model.address.AddressOutOfBoundsException;
+ import ghidra.program.model.address.AddressSet;
+ import ghidra.program.model.data.*;
+ import ghidra.program.model.lang.PrototypeModel;
+@@ -62,6 +63,8 @@ public class FillOutStructureHelper {
+ 
+ 	private static final String DEFAULT_BASENAME = "astruct";
+ 	private static final String DEFAULT_CATEGORY = "/auto_structs";
++	private static final String C166_ABI_PROPERTY = "c166.abi";
++	private static final String C166_TASKING_CLASSIC_LARGE = "tasking-classic-large";
+ 
+ 	private Program currentProgram;
+ 	private TaskMonitor monitor;
+@@ -152,6 +155,158 @@ public class FillOutStructureHelper {
+ 		return structDT;
+ 	}
+ 
++	/**
++	 * On C166 TASKING Classic Large, an array element address can be lowered as a
++	 * 16-bit offset plus {@code index * stride}, with the adjacent global word
++	 * supplying the page to a later SEGMENTOP.  If {@code exactSpot} is that
++	 * index, return the actual split far-pointer global which owns the structure.
++	 *
++	 * @param var variable selected in the decompiler
++	 * @param exactSpot exact selected varnode
++	 * @return split far-pointer base, or null when the pattern is not proven
++	 */
++	HighVariable findC166IndexedFarPointerBase(HighVariable var, Varnode exactSpot) {
++		if (!isC166TaskingClassicLarge() || var == null || exactSpot == null ||
++			exactSpot.getSize() != 2 || var.getDataType() instanceof Pointer) {
++			return null;
++		}
++
++		LinkedHashSet<Varnode> candidates = new LinkedHashSet<>();
++		candidates.add(exactSpot);
++		Collections.addAll(candidates, var.getInstances());
++		ArrayDeque<Varnode> work = new ArrayDeque<>(candidates);
++		while (!work.isEmpty() && candidates.size() <= 64) {
++			Varnode candidate = work.removeFirst();
++			if (candidate.getSize() != 2) {
++				continue;
++			}
++			Iterator<PcodeOp> descendants = candidate.getDescendants();
++			while (descendants.hasNext()) {
++				PcodeOp operation = descendants.next();
++				if (getC166ArrayStride(operation, candidate) > 0 &&
++					operation.getOutput() != null) {
++					HighVariable base =
++						findC166GlobalBaseFromScaledTerm(operation.getOutput());
++					if (base != null) {
++						return base;
++					}
++				}
++				if (!isC166IndexForwardingOp(operation, candidate) ||
++					operation.getOutput() == null || operation.getOutput().getSize() != 2) {
++					continue;
++				}
++				if (candidates.add(operation.getOutput())) {
++					work.addLast(operation.getOutput());
++				}
++			}
++		}
++		return null;
++	}
++
++	private boolean isC166IndexForwardingOp(PcodeOp operation, Varnode input) {
++		switch (operation.getOpcode()) {
++			case PcodeOp.COPY:
++			case PcodeOp.CAST:
++			case PcodeOp.INDIRECT:
++				return operation.getNumInputs() > 0 && operation.getInput(0) == input;
++			case PcodeOp.MULTIEQUAL:
++				for (Varnode candidate : operation.getInputs()) {
++					if (candidate == input) {
++						return true;
++					}
++				}
++				return false;
++			default:
++				return false;
++		}
++	}
++
++	private HighVariable findC166GlobalBaseFromScaledTerm(Varnode scaledTerm) {
++		ArrayDeque<Varnode> terms = new ArrayDeque<>();
++		Set<Varnode> visited = new HashSet<>();
++		terms.add(scaledTerm);
++		while (!terms.isEmpty()) {
++			Varnode term = terms.removeFirst();
++			if (!visited.add(term)) {
++				continue;
++			}
++			Iterator<PcodeOp> uses = term.getDescendants();
++			while (uses.hasNext()) {
++				PcodeOp add = uses.next();
++				if (add.getOpcode() != PcodeOp.INT_ADD || add.getNumInputs() != 2 ||
++					add.getOutput() == null) {
++					continue;
++				}
++				Varnode other = add.getInput(0) == term ? add.getInput(1) :
++					(add.getInput(1) == term ? add.getInput(0) : null);
++				if (other == null) {
++					continue;
++				}
++				if (other.isConstant()) {
++					terms.addLast(add.getOutput());
++					continue;
++				}
++				Varnode base = traceC166GlobalOffsetBase(other, 0, new HashSet<>());
++				if (base != null && base.getHigh() != null &&
++					(isFourByteDataPointer(base.getHigh().getDataType()) ||
++						getC166SplitGlobalPointerAddress(base.getHigh()) != null)) {
++					return base.getHigh();
++				}
++			}
++		}
++		return null;
++	}
++
++	/**
++	 * Identify the low word of a C166 PAGE:OFFSET global represented by two
++	 * adjacent 16-bit HighGlobals and consumed together by SEGMENTOP.
++	 */
++	Address getC166SplitGlobalPointerAddress(HighVariable var) {
++		if (!isC166TaskingClassicLarge() || var == null || var.getHighFunction() == null) {
++			return null;
++		}
++		Address lowAddress = null;
++		for (Varnode instance : var.getInstances()) {
++			Address address = instance.getAddress();
++			if (instance.getSize() == 2 && address != null && address.isMemoryAddress()) {
++				lowAddress = address;
++				break;
++			}
++		}
++		if (lowAddress == null) {
++			return null;
++		}
++		Data defined = currentProgram.getListing().getDefinedDataAt(lowAddress);
++		if (defined != null && isFourByteDataPointer(defined.getDataType())) {
++			return lowAddress;
++		}
++
++		Address pageAddress;
++		try {
++			pageAddress = lowAddress.add(2);
++		}
++		catch (AddressOutOfBoundsException e) {
++			return null;
++		}
++		Iterator<PcodeOpAST> operations = var.getHighFunction().getPcodeOps();
++		while (operations.hasNext()) {
++			PcodeOp operation = operations.next();
++			if (operation.getOpcode() != PcodeOp.SEGMENTOP ||
++				operation.getNumInputs() != 3) {
++				continue;
++			}
++			Address page = traceC166GlobalWordAddress(operation.getInput(1), 0,
++				new HashSet<>());
++			Varnode offsetBase = traceC166GlobalOffsetBase(operation.getInput(2), 0,
++				new HashSet<>());
++			if (pageAddress.equals(page) && offsetBase != null &&
++				lowAddress.equals(offsetBase.getAddress())) {
++				return lowAddress;
++			}
++		}
++		return null;
++	}
++
+ 	private void expandStructureSizeIfNeeded(Structure struct, int size) {
+ 		// TODO: How should an existing packed structure be handled? Growing and offset-based 
+ 		// placement does not apply
+@@ -493,10 +648,20 @@ public class FillOutStructureHelper {
+ 		Varnode startVN = var.getRepresentative();
+ 		ArrayList<PointerRef> todoList = new ArrayList<>();
+ 		HashSet<Varnode> doneList = new HashSet<>();
++		HashSet<Varnode> rootVarnodes = new HashSet<>();
++		// TASKING Classic Large lowers a PAGE:OFFSET data pointer to a physical address
++		// before dereferencing it. Keep this extra trace architecture- and ABI-specific;
++		// the generic structure recovery rules below remain unchanged for every other ABI.
++		boolean traceC166FarPointer = isC166TaskingClassicLarge() &&
++			isFourByteDataPointer(var.getDataType());
++		boolean traceC166SplitGlobalPointer =
++			getC166SplitGlobalPointerAddress(var) != null;
+ 
+ 		todoList.add(new PointerRef(startVN, 0));	// Base Varnode on the todo list
++		rootVarnodes.add(startVN);
+ 		Varnode[] instances = var.getInstances();
+ 		for (Varnode vn : instances) {
++			rootVarnodes.add(vn);
+ 			doneList.add(vn);		// Mark instances as done to avoid recursion issues
+ 			if (vn != startVN) {
+ 				todoList.add(new PointerRef(vn, 0));	// Make sure all instances are on the todo list
+@@ -524,6 +689,22 @@ public class FillOutStructureHelper {
+ 					case PcodeOp.INT_SUB:
+ 					case PcodeOp.INT_ADD:
+ 						if (!inputs[1].isConstant()) {
++							if (pcodeOp.getOpcode() == PcodeOp.INT_ADD && traceC166FarPointer &&
++								isC166FarPointerPageJoin(currentRef.varnode, inputs,
++									rootVarnodes)) {
++								putOnList(output, currentRef.offset, todoList, doneList);
++							}
++							else if (pcodeOp.getOpcode() == PcodeOp.INT_ADD &&
++								(traceC166FarPointer || traceC166SplitGlobalPointer)) {
++								Varnode indexTerm = inputs[0] == currentRef.varnode ? inputs[1] :
++									(inputs[1] == currentRef.varnode ? inputs[0] : null);
++								C166ArrayIndex arrayIndex = getC166ArrayIndex(indexTerm, 0);
++								if (arrayIndex != null) {
++									putOnList(output, currentRef.offset + arrayIndex.offset(),
++										todoList, doneList);
++									componentMap.setMinimumSize(arrayIndex.stride());
++								}
++							}
+ 							break;
+ 						}
+ 						long value = getSigned(inputs[1]);
+@@ -564,6 +745,24 @@ public class FillOutStructureHelper {
+ 						putOnList(output, currentRef.offset, todoList, doneList);
+ 						componentMap.setMinimumSize(currentRef.offset);
+ 						break;
++					case PcodeOp.SUBPIECE:
++						if (traceC166FarPointer &&
++							isC166FarPointerLowSubpiece(pcodeOp, rootVarnodes)) {
++							putOnList(output, currentRef.offset, todoList, doneList);
++						}
++						break;
++					case PcodeOp.INT_AND:
++						if (traceC166FarPointer &&
++							isC166FarPointerOffsetMask(currentRef.varnode, inputs)) {
++							putOnList(output, currentRef.offset, todoList, doneList);
++						}
++						break;
++					case PcodeOp.INT_ZEXT:
++						if (traceC166FarPointer && inputs[0] == currentRef.varnode &&
++							currentRef.varnode.getSize() == 2 && output.getSize() == 3) {
++							putOnList(output, currentRef.offset, todoList, doneList);
++						}
++						break;
+ 					case PcodeOp.LOAD:
+ 						outDt = DecompilerUtils.getDataTypeTraceForward(output);
+ 						componentMap.addDataType(currentRef.offset, outDt);
+@@ -622,6 +821,248 @@ public class FillOutStructureHelper {
+ 		}
+ 	}
+ 
++	private boolean isC166TaskingClassicLarge() {
++		return C166_TASKING_CLASSIC_LARGE.equals(
++			currentProgram.getLanguage().getProperty(C166_ABI_PROPERTY));
++	}
++
++	private long getC166ArrayStride(Varnode value) {
++		return value == null ? -1 : getC166ArrayStride(value.getDef(), null);
++	}
++
++	private C166ArrayIndex getC166ArrayIndex(Varnode value, int depth) {
++		if (value == null || depth > 2) {
++			return null;
++		}
++		long stride = getC166ArrayStride(value);
++		if (stride > 0) {
++			return new C166ArrayIndex(stride, 0);
++		}
++		PcodeOp definition = value.getDef();
++		if (definition == null || definition.getOpcode() != PcodeOp.INT_ADD ||
++			definition.getNumInputs() != 2) {
++			return null;
++		}
++		Varnode first = definition.getInput(0);
++		Varnode second = definition.getInput(1);
++		Varnode constant = first.isConstant() ? first : second;
++		Varnode nested = first.isConstant() ? second : first;
++		if (!constant.isConstant() || nested.isConstant()) {
++			return null;
++		}
++		C166ArrayIndex index = getC166ArrayIndex(nested, depth + 1);
++		return index == null ? null :
++			new C166ArrayIndex(index.stride(), index.offset() + getSigned(constant));
++	}
++
++	private record C166ArrayIndex(long stride, long offset) {
++	}
++
++	private long getC166ArrayStride(PcodeOp operation, Varnode index) {
++		if (operation == null || operation.getNumInputs() != 2 || operation.getOutput() == null ||
++			operation.getOutput().getSize() != 2) {
++			return -1;
++		}
++		long stride;
++		if (operation.getOpcode() == PcodeOp.INT_MULT) {
++			Varnode first = operation.getInput(0);
++			Varnode second = operation.getInput(1);
++			Varnode constant = first.isConstant() ? first : second;
++			Varnode variable = first.isConstant() ? second : first;
++			if (!constant.isConstant() || variable.isConstant() ||
++				(index != null && variable != index)) {
++				return -1;
++			}
++			stride = constant.getOffset();
++		}
++		else if (operation.getOpcode() == PcodeOp.INT_LEFT) {
++			if (!operation.getInput(1).isConstant() ||
++				(index != null && operation.getInput(0) != index)) {
++				return -1;
++			}
++			long shift = operation.getInput(1).getOffset();
++			if (shift >= 63) {
++				return -1;
++			}
++			stride = 1L << shift;
++		}
++		else {
++			return -1;
++		}
++		return stride >= 2 && stride <= 0x1000 ? stride : -1;
++	}
++
++	private Varnode traceC166GlobalOffsetBase(Varnode value, int depth,
++			Set<Varnode> visited) {
++		if (value == null || depth > 8 || !visited.add(value)) {
++			return null;
++		}
++		Address address = value.getAddress();
++		if (address != null && address.isMemoryAddress() &&
++			(value.getSize() == 2 || (value.getSize() == 4 && value.getHigh() != null &&
++				isFourByteDataPointer(value.getHigh().getDataType())))) {
++			return value;
++		}
++		PcodeOp definition = value.getDef();
++		if (definition == null) {
++			return null;
++		}
++		switch (definition.getOpcode()) {
++			case PcodeOp.COPY:
++			case PcodeOp.CAST:
++			case PcodeOp.INDIRECT:
++			case PcodeOp.SUBPIECE:
++				return traceC166GlobalOffsetBase(definition.getInput(0), depth + 1, visited);
++			case PcodeOp.INT_ADD:
++				if (definition.getNumInputs() != 2) {
++					return null;
++				}
++				Varnode first = definition.getInput(0);
++				Varnode second = definition.getInput(1);
++				if (first.isConstant() || getC166ArrayStride(first) > 0) {
++					return traceC166GlobalOffsetBase(second, depth + 1, visited);
++				}
++				if (second.isConstant() || getC166ArrayStride(second) > 0) {
++					return traceC166GlobalOffsetBase(first, depth + 1, visited);
++				}
++				return null;
++			default:
++				return null;
++		}
++	}
++
++	private Address traceC166GlobalWordAddress(Varnode value, int depth,
++			Set<Varnode> visited) {
++		if (value == null || depth > 8 || !visited.add(value)) {
++			return null;
++		}
++		Address address = value.getAddress();
++		if (value.getSize() == 2 && address != null && address.isMemoryAddress()) {
++			return address;
++		}
++		PcodeOp definition = value.getDef();
++		if (definition == null) {
++			return null;
++		}
++		switch (definition.getOpcode()) {
++			case PcodeOp.COPY:
++			case PcodeOp.CAST:
++			case PcodeOp.INDIRECT:
++			case PcodeOp.INT_ZEXT:
++			case PcodeOp.INT_SEXT:
++			case PcodeOp.SUBPIECE:
++				return traceC166GlobalWordAddress(definition.getInput(0), depth + 1, visited);
++			default:
++				return null;
++		}
++	}
++
++	private boolean isFourByteDataPointer(DataType dataType) {
++		while (dataType instanceof TypeDef typeDef) {
++			dataType = typeDef.getBaseDataType();
++		}
++		return dataType instanceof Pointer pointer && dataType.getLength() == 4 &&
++			!(pointer.getDataType() instanceof FunctionDefinition);
++	}
++
++	private boolean isC166FarPointerLowSubpiece(PcodeOp op, Set<Varnode> rootVarnodes) {
++		Varnode[] inputs = op.getInputs();
++		Varnode output = op.getOutput();
++		return inputs.length == 2 && output != null && inputs[1].isConstant() &&
++			inputs[1].getOffset() == 0 && inputs[0].getSize() == 4 && output.getSize() == 2 &&
++			tracesToRootThroughCopies(inputs[0], rootVarnodes, 0);
++	}
++
++	private boolean isC166FarPointerOffsetMask(Varnode current, Varnode[] inputs) {
++		if (current.getSize() != 2 || inputs.length != 2) {
++			return false;
++		}
++		Varnode other = inputs[0] == current ? inputs[1] :
++			(inputs[1] == current ? inputs[0] : null);
++		return other != null && other.isConstant() && other.getOffset() == 0x3fff;
++	}
++
++	private boolean isC166FarPointerPageJoin(Varnode current, Varnode[] inputs,
++			Set<Varnode> rootVarnodes) {
++		if (inputs.length != 2) {
++			return false;
++		}
++		Varnode pageContribution = inputs[0] == current ? inputs[1] :
++			(inputs[1] == current ? inputs[0] : null);
++		return pageContribution != null &&
++			isC166FarPointerPageContribution(pageContribution, rootVarnodes);
++	}
++
++	private boolean isC166FarPointerPageContribution(Varnode value,
++			Set<Varnode> rootVarnodes) {
++		PcodeOp scale = value.getDef();
++		if (scale == null || (scale.getOpcode() != PcodeOp.INT_MULT &&
++			scale.getOpcode() != PcodeOp.INT_LEFT)) {
++			return false;
++		}
++		Varnode[] scaleInputs = scale.getInputs();
++		if (scaleInputs.length != 2) {
++			return false;
++		}
++		Varnode page;
++		if (scale.getOpcode() == PcodeOp.INT_LEFT) {
++			if (!scaleInputs[1].isConstant() || scaleInputs[1].getOffset() != 14) {
++				return false;
++			}
++			page = scaleInputs[0];
++		}
++		else {
++			Varnode scaleValue =
++				scaleInputs[0].isConstant() ? scaleInputs[0] : scaleInputs[1];
++			if (!scaleValue.isConstant() || scaleValue.getOffset() != 0x4000) {
++				return false;
++			}
++			page = scaleInputs[0].isConstant() ? scaleInputs[1] : scaleInputs[0];
++		}
++
++		PcodeOp extension = page.getDef();
++		if (extension == null || extension.getOpcode() != PcodeOp.INT_ZEXT) {
++			return false;
++		}
++		PcodeOp subpiece = extension.getInput(0).getDef();
++		if (subpiece == null || subpiece.getOpcode() != PcodeOp.SUBPIECE ||
++			subpiece.getNumInputs() != 2 || !subpiece.getInput(1).isConstant()) {
++			return false;
++		}
++
++		long byteOffset = subpiece.getInput(1).getOffset();
++		Varnode source = subpiece.getInput(0);
++		if (byteOffset == 2) {
++			return tracesToRootThroughCopies(source, rootVarnodes, 0);
++		}
++		if (byteOffset != 0) {
++			return false;
++		}
++		PcodeOp shift = source.getDef();
++		if (shift == null || shift.getOpcode() != PcodeOp.INT_RIGHT ||
++			shift.getNumInputs() != 2 || !shift.getInput(1).isConstant() ||
++			shift.getInput(1).getOffset() != 16) {
++			return false;
++		}
++		return tracesToRootThroughCopies(shift.getInput(0), rootVarnodes, 0);
++	}
++
++	private boolean tracesToRootThroughCopies(Varnode value, Set<Varnode> rootVarnodes,
++			int depth) {
++		if (rootVarnodes.contains(value)) {
++			return true;
++		}
++		if (depth >= 4) {
++			return false;
++		}
++		PcodeOp definition = value.getDef();
++		if (definition == null || (definition.getOpcode() != PcodeOp.CAST &&
++			definition.getOpcode() != PcodeOp.COPY)) {
++			return false;
++		}
++		return tracesToRootThroughCopies(definition.getInput(0), rootVarnodes, depth + 1);
++	}
++
+ 	private long getSigned(Varnode varnode) {
+ 		long mask = 0x80L << ((varnode.getSize() - 1) * 8);
+ 		long value = varnode.getOffset();
