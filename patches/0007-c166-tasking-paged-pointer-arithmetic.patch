@@ -1,6 +1,27 @@
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
+index 43886b7b..9060d10c 100644
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc
+@@ -5474,8 +5474,12 @@ int4 ActionInferTypes::apply(Funcdata &data)
+     data.getArch()->printDebug(s.str());
+   }
+ #endif
+-  if (localcount >= 7) {       // This constant arrived at empirically
+-    if (localcount == 7) {
++  // Layered C166 pointer recovery can create new typed SSA Varnodes after the
++  // upstream budget; preserve the original limit for every other profile.
++  int4 passLimit = data.getArch()->hasProcessorProperty(
++    "c166.abi","tasking-classic-large") ? 20 : 7;
++  if (localcount >= passLimit) {       // This constant arrived at empirically
++    if (localcount == passLimit) {
+       data.warningHeader("Type propagation algorithm not settling");
+       data.setTypeRecoveryExceeded();
+       localcount += 1;
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
+index 062f6fdc..0aa79380 100644
 --- a/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
 +++ b/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
-@@ -9066,6 +9066,125 @@
+@@ -9066,6 +9066,826 @@ int4 RulePieceFarPointer::applyOp(PcodeOp *op,Funcdata &data)
    return 1;
  }
  
@@ -34,6 +55,12 @@
 +  if (!vn->isWritten() || vn->getSize() != expectedSize)
 +    return (Varnode *)0;
 +  PcodeOp *subop = vn->getDef();
++  if (subop->code() == CPUI_CAST && expectedOffset == 0) {
++    Varnode *whole = stripC166FarPointerCasts(subop->getIn(0));
++    if (whole->getSize() >= expectedSize)
++      return whole;
++    return (Varnode *)0;
++  }
 +  if (subop->code() != CPUI_SUBPIECE || !subop->getIn(1)->isConstant())
 +    return (Varnode *)0;
 +  int4 byteOffset = (int4)subop->getIn(1)->getOffset();
@@ -48,33 +75,643 @@
 +      whole = stripC166FarPointerCasts(shiftop->getIn(0));
 +    }
 +  }
++  // A pointer cast to an unsigned host-sized integer is commonly introduced
++  // while the decompiler isolates its high word.  The extension is not part of
++  // the C166 far-pointer representation, so normalize it back to the pointer.
++  if (whole->isWritten() && whole->getDef()->code() == CPUI_INT_ZEXT) {
++    Varnode *extended = stripC166FarPointerCasts(whole->getDef()->getIn(0));
++    if (extended->getSize() >= expectedOffset + expectedSize)
++      whole = extended;
++  }
 +  if (byteOffset != expectedOffset ||
 +      whole->getSize() < expectedOffset + expectedSize)
 +    return (Varnode *)0;
 +  return whole;
 +}
 +
-+/// Recognize TASKING Classic Large's page-local pointer addition feeding an
-+/// EXTP dereference.  The generated machine code preserves PAGE and performs
-+/// 14-bit arithmetic on OFFSET, so the high-level operation is ptr + constant.
-+static Varnode *recoverC166PagedPointerAdd(PcodeOp *op,Funcdata &data,
-+					   SegmentOp *segdef,uintb &offset)
++/// Recover a semantic return type before it has propagated onto the physical
++/// join Varnode.  This prevents a typed code pointer or scalar call result from
++/// being reinterpreted as a far data pointer merely because its current SSA
++/// type is still undefined4.
++static Datatype *recoverC166CallOutputType(Funcdata &data,Varnode *vn)
++
++{
++  vn = stripC166FarPointerCasts(vn);
++  if (!vn->isWritten())
++    return (Datatype *)0;
++  PcodeOp *def = vn->getDef();
++  if (def->code() != CPUI_CALL && def->code() != CPUI_CALLIND)
++    return (Datatype *)0;
++  FuncCallSpecs *fc = data.getCallSpecs(def);
++  if (fc == (FuncCallSpecs *)0 || fc->getOutput() == (ProtoParameter *)0)
++    return (Datatype *)0;
++  Datatype *type = fc->getOutput()->getType();
++  if (type == (Datatype *)0 || type->getSize() != vn->getSize())
++    return (Datatype *)0;
++  return type;
++}
++
++/// Reduce a pointer expression to a root and a constant byte offset.  This is
++/// deliberately limited to the constant forms emitted for C166 memory loads.
++static Varnode *recoverC166PointerRoot(Varnode *vn,uintb &offset)
++
++{
++  offset = 0;
++  for(int4 i=0;i<8;++i) {
++    vn = stripC166FarPointerCasts(vn);
++    if (!vn->isWritten()) break;
++    PcodeOp *def = vn->getDef();
++    uintb addend;
++    if ((def->code() == CPUI_INT_ADD || def->code() == CPUI_PTRSUB) &&
++        def->numInput() == 2 && def->getIn(1)->isConstant())
++      addend = def->getIn(1)->getOffset();
++    else if (def->code() == CPUI_PTRADD && def->numInput() == 3 &&
++             def->getIn(1)->isConstant() && def->getIn(2)->isConstant()) {
++      uintb index = def->getIn(1)->getOffset();
++      uintb scale = def->getIn(2)->getOffset();
++      if (scale == 0 || index > (~((uintb)0) - offset) / scale)
++        return (Varnode *)0;
++      addend = index * scale;
++    }
++    else if (def->code() == CPUI_INT_AND && def->numInput() == 2) {
++      int4 valueSlot;
++      if (def->getIn(0)->isConstant() && def->getIn(0)->getOffset() == 0x3fff)
++	valueSlot = 1;
++      else if (def->getIn(1)->isConstant() &&
++	       def->getIn(1)->getOffset() == 0x3fff)
++	valueSlot = 0;
++      else
++	break;
++      vn = def->getIn(valueSlot);
++      continue;
++    }
++    else
++      break;
++    if (addend > ~((uintb)0) - offset)
++      return (Varnode *)0;
++    offset += addend;
++    vn = def->getIn(0);
++  }
++  return stripC166FarPointerCasts(vn);
++}
++
++/// Flatten the constant part of an address expression while preserving all
++/// non-constant terms.  This is used to compare the two independently lifted
++/// addresses produced by post-increment word loads.
++static bool collectC166AddressTerms(Varnode *vn,vector<Varnode *> &terms,
++				     uintb &constant,int4 depth)
++
++{
++  if (depth >= 8 || terms.size() >= 8)
++    return false;
++  vn = stripC166FarPointerCasts(vn);
++  if (vn->isConstant()) {
++    if (vn->getOffset() > ~((uintb)0) - constant)
++      return false;
++    constant += vn->getOffset();
++    return true;
++  }
++  if (!vn->isWritten()) {
++    terms.push_back(vn);
++    return true;
++  }
++  PcodeOp *def = vn->getDef();
++  if (def->code() == CPUI_INT_ADD && def->numInput() == 2)
++    return collectC166AddressTerms(def->getIn(0),terms,constant,depth+1) &&
++      collectC166AddressTerms(def->getIn(1),terms,constant,depth+1);
++  if (def->code() == CPUI_PTRSUB && def->numInput() == 2 &&
++      def->getIn(1)->isConstant()) {
++    uintb offset = def->getIn(1)->getOffset();
++    if (offset > ~((uintb)0) - constant)
++      return false;
++    constant += offset;
++    return collectC166AddressTerms(def->getIn(0),terms,constant,depth+1);
++  }
++  if (def->code() == CPUI_PTRADD && def->numInput() == 3 &&
++      def->getIn(1)->isConstant() && def->getIn(2)->isConstant()) {
++    uintb index = def->getIn(1)->getOffset();
++    uintb scale = def->getIn(2)->getOffset();
++    if (scale != 0 && index <= (~((uintb)0) - constant) / scale) {
++      constant += index * scale;
++      return collectC166AddressTerms(def->getIn(0),terms,constant,depth+1);
++    }
++    return false;
++  }
++  terms.push_back(vn);
++  return true;
++}
++
++/// Check whether two independently constructed address expressions differ by
++/// exactly one word.  All non-constant terms must match functionally, so an
++/// unrelated pair of scalar loads cannot be folded merely because their final
++/// constants happen to be adjacent.
++static bool areC166AddressExpressionsAdjacent(Varnode *highAddress,
++					       Varnode *lowAddress,int4 wordSize)
++
++{
++  vector<Varnode *> highTerms;
++  vector<Varnode *> lowTerms;
++  uintb highConstant = 0;
++  uintb lowConstant = 0;
++  if (!collectC166AddressTerms(highAddress,highTerms,highConstant,0) ||
++      !collectC166AddressTerms(lowAddress,lowTerms,lowConstant,0) ||
++      highTerms.size() != lowTerms.size() ||
++      lowConstant > ~((uintb)0) - wordSize ||
++      highConstant != lowConstant + wordSize)
++    return false;
++  vector<bool> matched(lowTerms.size(),false);
++  for(int4 i=0;i<(int4)highTerms.size();++i) {
++    bool found = false;
++    for(int4 j=0;j<(int4)lowTerms.size();++j) {
++      if (matched[j])
++	continue;
++      bool equivalent = highTerms[i] == lowTerms[j] ||
++	functionalEquality(highTerms[i],lowTerms[j]);
++      if (!equivalent && highTerms[i]->isWritten() && lowTerms[j]->isWritten()) {
++	PcodeOp *highDef = highTerms[i]->getDef();
++	PcodeOp *lowDef = lowTerms[j]->getDef();
++	// Heritage can duplicate one non-volatile base-pointer LOAD while
++	// lifting the two adjacent word addresses.  Accept only duplicates in
++	// the same block, attributed to adjacent machine instructions, and
++	// reading the same address.
++	uintb highOffset = highDef->getAddr().getOffset();
++	uintb lowOffset = lowDef->getAddr().getOffset();
++	uintb distance = highOffset >= lowOffset ? highOffset - lowOffset :
++						lowOffset - highOffset;
++	equivalent = highDef->code() == CPUI_LOAD && lowDef->code() == CPUI_LOAD &&
++	  highDef->getParent() == lowDef->getParent() &&
++	  highDef->getAddr().getSpace() == lowDef->getAddr().getSpace() &&
++	  distance <= 8 &&
++	  highDef->getIn(0)->getSpaceFromConst() ==
++					 lowDef->getIn(0)->getSpaceFromConst() &&
++	  (highDef->getIn(1) == lowDef->getIn(1) ||
++	   functionalEquality(highDef->getIn(1),lowDef->getIn(1)));
++      }
++      if (!equivalent)
++	continue;
++      matched[j] = true;
++      found = true;
++      break;
++    }
++    if (!found)
++      return false;
++  }
++  return true;
++}
++
++/// Confirm that two LOAD addresses select adjacent words in the same object.
++/// Segmented addresses may be represented by distinct SEGMENTOPs even when
++/// their PAGE inputs and OFFSET roots are shared.
++static bool areAdjacentC166LoadAddresses(Varnode *highAddress,Varnode *lowAddress,
++					 int4 wordSize)
++
++{
++  if (areC166AddressExpressionsAdjacent(highAddress,lowAddress,wordSize))
++    return true;
++  uintb highOffset;
++  uintb lowOffset;
++  Varnode *highRoot = recoverC166PointerRoot(highAddress,highOffset);
++  Varnode *lowRoot = recoverC166PointerRoot(lowAddress,lowOffset);
++  if (highRoot == (Varnode *)0 || lowRoot == (Varnode *)0)
++    return false;
++  if (highRoot == lowRoot)
++    return highOffset == lowOffset + wordSize;
++  if (!highRoot->isWritten() || !lowRoot->isWritten())
++    return false;
++  PcodeOp *highSegment = highRoot->getDef();
++  PcodeOp *lowSegment = lowRoot->getDef();
++  if (highSegment->code() != CPUI_SEGMENTOP ||
++      lowSegment->code() != CPUI_SEGMENTOP ||
++      highSegment->numInput() != 3 || lowSegment->numInput() != 3 ||
++      highSegment->getIn(0)->getSpaceFromConst() !=
++					 lowSegment->getIn(0)->getSpaceFromConst() ||
++      stripC166FarPointerCasts(highSegment->getIn(1)) !=
++					 stripC166FarPointerCasts(lowSegment->getIn(1)))
++    return false;
++  uintb highInnerOffset;
++  uintb lowInnerOffset;
++  Varnode *highInnerRoot = recoverC166PointerRoot(highSegment->getIn(2),
++						  highInnerOffset);
++  Varnode *lowInnerRoot = recoverC166PointerRoot(lowSegment->getIn(2),
++						 lowInnerOffset);
++  return highInnerRoot != (Varnode *)0 && highInnerRoot == lowInnerRoot &&
++    highOffset + highInnerOffset == lowOffset + lowInnerOffset + wordSize;
++}
++
++/// Follow a single typed-pointer expression to the data access it supplies.
++/// This accepts only operations which preserve one unambiguous pointer path.
++static PcodeOp *findC166FarPointerMemoryUse(Varnode *vn)
++
++{
++  for(int4 i=0;i<8;++i) {
++    PcodeOp *useop = vn->loneDescend();
++    if (useop == (PcodeOp *)0)
++      return (PcodeOp *)0;
++    if ((useop->code() == CPUI_LOAD && useop->getIn(1) == vn) ||
++        (useop->code() == CPUI_STORE && useop->getIn(1) == vn))
++      return useop;
++    bool followsPointer = false;
++    switch(useop->code()) {
++    case CPUI_COPY:
++    case CPUI_CAST:
++    case CPUI_INT_ZEXT:
++      followsPointer = useop->getIn(0) == vn;
++      break;
++    case CPUI_INT_ADD:
++      followsPointer = useop->getIn(0) == vn || useop->getIn(1) == vn;
++      break;
++    case CPUI_PTRSUB:
++    case CPUI_PTRADD:
++      followsPointer = useop->getIn(0) == vn;
++      break;
++    default:
++      break;
++    }
++    if (!followsPointer || useop->getOut() == (Varnode *)0)
++      return (PcodeOp *)0;
++    vn = useop->getOut();
++  }
++  return (PcodeOp *)0;
++}
++
++/// Infer the data-pointer type represented by a C166 SEGMENTOP.  Prefer an
++/// already propagated pointer type, then use the terminal LOAD/STORE type.
++static Datatype *inferC166FarPointerType(PcodeOp *segmentOp,Funcdata &data,
++					 SegmentOp *segdef)
++
++{
++  PcodeOp *firstUse = segmentOp->getOut()->loneDescend();
++  PcodeOp *memoryUse = findC166FarPointerMemoryUse(segmentOp->getOut());
++  if (firstUse == (PcodeOp *)0 || memoryUse == (PcodeOp *)0)
++    return (Datatype *)0;
++  Datatype *type = segmentOp->getOut()->getTypeReadFacing(firstUse);
++  if (getC166TaskingClassicLargeSegment(data,type) != segdef) {
++    Datatype *pointedType;
++    if (memoryUse->code() == CPUI_LOAD)
++      pointedType = memoryUse->getOut()->getTypeDefFacing();
++    else if (memoryUse->code() == CPUI_STORE)
++      pointedType = memoryUse->getIn(2)->getTypeReadFacing(memoryUse);
++    else
++      return (Datatype *)0;
++    AddrSpace *spc = data.getArch()->getDefaultDataSpace();
++    type = data.getArch()->types->getTypePointer(
++	segdef->getBaseSize() + segdef->getInnerSize(),pointedType,spc->getWordSize());
++    if (getC166TaskingClassicLargeSegment(data,type) != segdef)
++      return (Datatype *)0;
++  }
++  TypePointer *pointerType = (TypePointer *)type;
++  if (pointerType->getPtrTo()->getMetatype() == TYPE_CODE)
++    return (Datatype *)0;
++  return type;
++}
++
++struct C166FarPointerPairEvidence {
++  bool related;
++  bool typedOrigin;
++  Varnode *whole;
++};
++
++/// Match physical input halves against a formal far data-pointer parameter.
++/// The join record is ABI data supplied by the compiler specification, so this
++/// is stronger evidence than merely seeing adjacent registers.
++static Varnode *findC166FarPointerInputWhole(Funcdata &data,SegmentOp *segdef,
++					     Varnode *high,Varnode *low)
++
++{
++  if (!high->isInput() || !low->isInput())
++    return (Varnode *)0;
++  FuncProto &proto = data.getFuncProto();
++  for(int4 i=0;i<proto.numParams();++i) {
++    ProtoParameter *param = proto.getParam(i);
++    Datatype *type = param->getType();
++    if (getC166TaskingClassicLargeSegment(data,type) != segdef ||
++	((TypePointer *)type)->getPtrTo()->getMetatype() == TYPE_CODE)
++      continue;
++    Address address = param->getAddress();
++    if (address.getSpace()->getType() != IPTR_JOIN)
++      continue;
++    JoinRecord *join = data.getArch()->findJoin(address.getOffset());
++    if (join->numPieces() != 2)
++      continue;
++    const VarnodeData &highPiece(join->getPiece(0));
++    const VarnodeData &lowPiece(join->getPiece(1));
++    if (high->getAddr() == Address(highPiece.space,highPiece.offset) &&
++	high->getSize() == highPiece.size &&
++	low->getAddr() == Address(lowPiece.space,lowPiece.offset) &&
++	low->getSize() == lowPiece.size)
++      return data.findVarnodeInput(param->getSize(),address);
++  }
++  return (Varnode *)0;
++}
++
++/// Prove that two SSA values are the PAGE/OFFSET halves of one far pointer.
++/// Parallel MULTIEQUAL and INDIRECT operations are followed in lock-step;
++/// adjacent LOADs are accepted as spill/reload evidence only when some path is
++/// ultimately anchored in a typed whole pointer or ABI parameter.
++static C166FarPointerPairEvidence proveC166FarPointerPair(Funcdata &data,
++		SegmentOp *segdef,Varnode *high,Varnode *low,
++		vector<pair<Varnode *,Varnode *> > &active,int4 depth)
++
++{
++  C166FarPointerPairEvidence invalid = { false, false, (Varnode *)0 };
++  C166FarPointerPairEvidence related = { true, false, (Varnode *)0 };
++  if (depth >= 16)
++    return invalid;
++  high = stripC166FarPointerCasts(high);
++  low = stripC166FarPointerCasts(low);
++  if (high->getSize() != segdef->getBaseSize() ||
++      low->getSize() != segdef->getInnerSize())
++    return invalid;
++
++  Varnode *highWhole = recoverC166FarPointerWhole(high,
++				 segdef->getInnerSize(),segdef->getBaseSize());
++  Varnode *lowWhole = recoverC166FarPointerWhole(low,0,segdef->getInnerSize());
++  if (highWhole != (Varnode *)0 && highWhole == lowWhole) {
++    Datatype *type = recoverC166CallOutputType(data,highWhole);
++    if (type == (Datatype *)0)
++      type = highWhole->getTypeDefFacing();
++    if (getC166TaskingClassicLargeSegment(data,type) == segdef &&
++	((TypePointer *)type)->getPtrTo()->getMetatype() != TYPE_CODE)
++      return { true, true, highWhole };
++    if (type->getMetatype() == TYPE_PTR)
++      return invalid;
++    if (highWhole->isTypeLock())
++      return related;
++    // Type recovery may not yet have propagated the formal pointer type into a
++    // spill whole.  Preserve it as a candidate; the terminal memory access
++    // supplies the type before RuleSegment accepts the reconstruction.
++    return { true, true, highWhole };
++  }
++  // PUSH sequences can spill PAGE then OFFSET into ascending stack addresses.
++  // The little-endian temporary whole then exposes PAGE at SUBPIECE(...,0)
++  // and OFFSET at SUBPIECE(...,2), although the register pair itself is
++  // unchanged.  The reversed SUBPIECE layout proves the two words came from
++  // one stack object, while the surrounding SEGMENTOP and its terminal memory
++  // use prove data-pointer semantics.  No source Varnode is reused because the
++  // temporary whole stores the words in reverse pointer order.
++  if (high->isWritten() && low->isWritten()) {
++    PcodeOp *highSub = high->getDef();
++    PcodeOp *lowSub = low->getDef();
++    if (highSub->code() == CPUI_SUBPIECE && lowSub->code() == CPUI_SUBPIECE &&
++	highSub->getIn(0) == lowSub->getIn(0) &&
++	highSub->getIn(1)->isConstant() && lowSub->getIn(1)->isConstant() &&
++	highSub->getIn(1)->getOffset() == 0 &&
++	lowSub->getIn(1)->getOffset() == segdef->getBaseSize() &&
++	highSub->getIn(0)->getSpace()->getType() == IPTR_SPACEBASE) {
++      return { true, true, (Varnode *)0 };
++    }
++  }
++  Varnode *inputWhole = findC166FarPointerInputWhole(data,segdef,high,low);
++  if (inputWhole != (Varnode *)0)
++    return { true, true, inputWhole };
++  if (high->isConstant() && low->isConstant())
++    return related;
++
++  for(int4 i=0;i<(int4)active.size();++i)
++    if (active[i].first == high && active[i].second == low)
++      return related;
++  if (!high->isWritten() || !low->isWritten())
++    return invalid;
++  PcodeOp *highDef = high->getDef();
++  PcodeOp *lowDef = low->getDef();
++  if (highDef->code() == CPUI_LOAD && lowDef->code() == CPUI_LOAD &&
++      highDef->getIn(0)->getSpaceFromConst() ==
++					 lowDef->getIn(0)->getSpaceFromConst() &&
++      areAdjacentC166LoadAddresses(highDef->getIn(1),lowDef->getIn(1),
++					   segdef->getInnerSize()))
++    return related;
++
++  active.push_back({ high, low });
++  Varnode *commonWhole = (Varnode *)0;
++  bool hasTypedOrigin = false;
++  Varnode *lowBase = (Varnode *)0;
++  if (lowDef->code() == CPUI_INT_ADD && lowDef->numInput() == 2) {
++    if (lowDef->getIn(0)->isConstant())
++      lowBase = lowDef->getIn(1);
++    else if (lowDef->getIn(1)->isConstant())
++      lowBase = lowDef->getIn(0);
++  }
++  else if (lowDef->code() == CPUI_PTRSUB && lowDef->numInput() == 2 &&
++	   lowDef->getIn(1)->isConstant())
++    lowBase = lowDef->getIn(0);
++  else if (lowDef->code() == CPUI_PTRADD && lowDef->numInput() == 3 &&
++	   lowDef->getIn(1)->isConstant() && lowDef->getIn(2)->isConstant())
++    lowBase = lowDef->getIn(0);
++  if (lowBase != (Varnode *)0) {
++    C166FarPointerPairEvidence base = proveC166FarPointerPair(data,segdef,
++					 high,lowBase,active,depth+1);
++    active.pop_back();
++    if (!base.related)
++      return invalid;
++    // The original whole is the pointer before OFFSET arithmetic.  Keep only
++    // its type evidence; the caller rebuilds the actual adjusted PAGE:OFFSET.
++    return { true, base.typedOrigin, (Varnode *)0 };
++  }
++  if (highDef->code() == CPUI_MULTIEQUAL &&
++      lowDef->code() == CPUI_MULTIEQUAL &&
++      highDef->getParent() == lowDef->getParent() &&
++      highDef->numInput() == lowDef->numInput()) {
++    bool hasMissingWhole = false;
++    for(int4 i=0;i<highDef->numInput();++i) {
++      C166FarPointerPairEvidence input = proveC166FarPointerPair(data,segdef,
++	  highDef->getIn(i),lowDef->getIn(i),active,depth+1);
++      if (!input.related) {
++	active.pop_back();
++	return invalid;
++      }
++      hasTypedOrigin = hasTypedOrigin || input.typedOrigin;
++      if (input.whole == (Varnode *)0)
++	hasMissingWhole = true;
++      if (commonWhole == (Varnode *)0)
++	commonWhole = input.whole;
++      else if (commonWhole != input.whole) {
++	hasMissingWhole = true;
++      }
++    }
++    if (hasMissingWhole)
++      commonWhole = (Varnode *)0;
++  }
++  else if (highDef->code() == CPUI_INDIRECT &&
++	   lowDef->code() == CPUI_INDIRECT &&
++	   highDef->getIn(1) == lowDef->getIn(1)) {
++    C166FarPointerPairEvidence input = proveC166FarPointerPair(data,segdef,
++	  highDef->getIn(0),lowDef->getIn(0),active,depth+1);
++    if (!input.related) {
++      active.pop_back();
++      return invalid;
++    }
++    commonWhole = input.whole;
++    hasTypedOrigin = input.typedOrigin;
++  }
++  else {
++    active.pop_back();
++    return invalid;
++  }
++  active.pop_back();
++  return { true, hasTypedOrigin, commonWhole };
++}
++
++static Varnode *buildC166FarPointerValue(PcodeOp *follow,Funcdata &data,
++					 Varnode *high,Varnode *low,
++					 Datatype *type);
++
++/// Rejoin a far pointer loaded as two adjacent words.  TASKING Classic emits
++/// separate OFFSET/PAGE loads from pointer fields; unlike SUBPIECEs, these have
++/// no pre-existing whole Varnode for RuleSegment to recover.
++static Varnode *recoverC166FarPointerLoadPair(PcodeOp *segmentOp,Funcdata &data,
++					      SegmentOp *segdef,Varnode *high,Varnode *low)
++
++{
++  high = stripC166FarPointerCasts(high);
++  low = stripC166FarPointerCasts(low);
++  if (!high->isWritten() || !low->isWritten() ||
++      high->getSize() != segdef->getBaseSize() ||
++      low->getSize() != segdef->getInnerSize())
++    return (Varnode *)0;
++  PcodeOp *highLoad = high->getDef();
++  PcodeOp *lowLoad = low->getDef();
++  if (highLoad->code() != CPUI_LOAD || lowLoad->code() != CPUI_LOAD ||
++      highLoad->getIn(0)->getSpaceFromConst() !=
++					 lowLoad->getIn(0)->getSpaceFromConst())
++    return (Varnode *)0;
++  if (!areAdjacentC166LoadAddresses(highLoad->getIn(1),lowLoad->getIn(1),
++					    segdef->getInnerSize()))
++    return (Varnode *)0;
++
++  Datatype *type = inferC166FarPointerType(segmentOp,data,segdef);
++  if (type == (Datatype *)0)
++    return (Varnode *)0;
++  PcodeOp *wholeLoad = data.newOp(2,segmentOp->getAddr());
++  data.opSetOpcode(wholeLoad,CPUI_LOAD);
++  data.newUniqueOut(segdef->getBaseSize() + segdef->getInnerSize(),wholeLoad);
++  data.opSetInput(wholeLoad,lowLoad->getIn(0),0);
++  data.opSetInput(wholeLoad,lowLoad->getIn(1),1);
++  data.opInsertBefore(wholeLoad,segmentOp);
++  wholeLoad->getOut()->updateType(type,true,false);
++  return wholeLoad->getOut();
++}
++
++struct C166PagedPointerTerm {
++  Varnode *vn;
++  uintb scale;
++};
++
++/// Flatten the unsigned OFFSET expression of a paged C166 address.  Only
++/// addition and the pointer forms already produced by the decompiler are
++/// traversed; all other arithmetic remains an opaque scalar term.
++static bool collectC166PagedPointerTerms(Varnode *vn,
++					 vector<C166PagedPointerTerm> &terms,
++					 uintb &constant,int4 depth)
++
++{
++  if (depth >= 8 || terms.size() >= 8)
++    return false;
++  vn = stripC166FarPointerCasts(vn);
++  if (vn->isConstant()) {
++    if (vn->getOffset() > 0x3fff - constant)
++      return false;
++    constant += vn->getOffset();
++    return true;
++  }
++  if (!vn->isWritten()) {
++    terms.push_back({ vn, 1 });
++    return true;
++  }
++  PcodeOp *def = vn->getDef();
++  if (def->code() == CPUI_INT_ADD && def->numInput() == 2)
++    return collectC166PagedPointerTerms(def->getIn(0),terms,constant,depth+1) &&
++      collectC166PagedPointerTerms(def->getIn(1),terms,constant,depth+1);
++  if (def->code() == CPUI_PTRSUB && def->numInput() == 2 &&
++      def->getIn(1)->isConstant()) {
++    uintb offset = def->getIn(1)->getOffset();
++    if (offset > 0x3fff - constant)
++      return false;
++    constant += offset;
++    return collectC166PagedPointerTerms(def->getIn(0),terms,constant,depth+1);
++  }
++  if (def->code() == CPUI_PTRADD && def->numInput() == 3 &&
++      def->getIn(2)->isConstant()) {
++    uintb scale = def->getIn(2)->getOffset();
++    if (scale == 0 || scale > 0x3fff ||
++        !collectC166PagedPointerTerms(def->getIn(0),terms,constant,depth+1))
++      return false;
++    if (def->getIn(1)->isConstant()) {
++      uintb index = def->getIn(1)->getOffset();
++      if (index > (0x3fff - constant) / scale)
++        return false;
++      constant += index * scale;
++    }
++    else {
++      if (terms.size() >= 8)
++        return false;
++      terms.push_back({ stripC166FarPointerCasts(def->getIn(1)), scale });
++    }
++    return true;
++  }
++  terms.push_back({ vn, 1 });
++  return true;
++}
++
++/// Widen one unsigned OFFSET term without changing its value.
++static Varnode *extendC166PagedPointerTerm(PcodeOp *follow,Funcdata &data,
++					   Varnode *vn,int4 size)
++
++{
++  vn = stripC166FarPointerCasts(vn);
++  if (vn->getSize() > size)
++    return (Varnode *)0;
++  if (vn->getSize() == size)
++    return vn;
++  PcodeOp *extop = data.newOp(1,follow->getAddr());
++  data.opSetOpcode(extop,CPUI_INT_ZEXT);
++  data.newUniqueOut(size,extop);
++  data.opSetInput(extop,vn,0);
++  data.opInsertBefore(extop,follow);
++  return extop->getOut();
++}
++
++/// Build the raw PAGE:OFFSET pointer value without CPUI_PIECE.  PIECE marks
++/// both inputs as precision halves and can trigger global double-width rewrites
++/// across large phi graphs.  The equivalent unsigned expression is local and
++/// leaves the original SSA variables untouched.
++static Varnode *buildC166FarPointerValue(PcodeOp *follow,Funcdata &data,
++					 Varnode *high,Varnode *low,
++					 Datatype *type)
++
++{
++  int4 size = high->getSize() + low->getSize();
++  Varnode *wideHigh = extendC166PagedPointerTerm(follow,data,high,size);
++  Varnode *wideLow = extendC166PagedPointerTerm(follow,data,low,size);
++  if (wideHigh == (Varnode *)0 || wideLow == (Varnode *)0)
++    return (Varnode *)0;
++  PcodeOp *shift = data.newOpBefore(follow,CPUI_INT_LEFT,wideHigh,
++				    data.newConstant(size,low->getSize() * 8));
++  PcodeOp *combine = data.newOpBefore(follow,CPUI_INT_OR,shift->getOut(),wideLow);
++  combine->getOut()->updateType(type);
++  return combine->getOut();
++}
++
++/// Recognize TASKING Classic Large's page-local OFFSET arithmetic feeding an
++/// EXTP dereference.  The generated machine code preserves PAGE while masking
++/// OFFSET to 14 bits.  Rebuild the typed far pointer for identity, constant,
++/// and scalar-indexed forms instead of exposing representation arithmetic.
++static Varnode *recoverC166PagedPointer(PcodeOp *op,Funcdata &data,
++					SegmentOp *segdef)
 +
 +{
 +  if (!data.getArch()->hasProcessorProperty("c166.abi","tasking-classic-large") ||
 +      !segdef->hasFarPointerSupport() || segdef->getBaseSize() != 2 ||
 +      segdef->getInnerSize() != 2)
 +    return (Varnode *)0;
-+  PcodeOp *useop = op->getOut()->loneDescend();
-+  if (useop == (PcodeOp *)0 ||
-+      ((useop->code() != CPUI_LOAD || useop->getIn(1) != op->getOut()) &&
-+       (useop->code() != CPUI_STORE || useop->getIn(1) != op->getOut())))
++  if (findC166FarPointerMemoryUse(op->getOut()) == (PcodeOp *)0)
 +    return (Varnode *)0;
 +
 +  Varnode *inner = stripC166FarPointerCasts(op->getIn(2));
-+  if (!inner->isWritten()) return (Varnode *)0;
++  if (!inner->isWritten())
++    return (Varnode *)0;
 +  PcodeOp *maskop = inner->getDef();
-+  if (maskop->code() != CPUI_INT_AND) return (Varnode *)0;
++  if (maskop->code() != CPUI_INT_AND)
++    return (Varnode *)0;
 +  int4 valueSlot;
 +  if (maskop->getIn(0)->isConstant() &&
 +      maskop->getIn(0)->getOffset() == 0x3fff)
@@ -85,60 +722,141 @@
 +  else
 +    return (Varnode *)0;
 +
-+  Varnode *sum = stripC166FarPointerCasts(maskop->getIn(valueSlot));
-+  if (!sum->isWritten()) return (Varnode *)0;
-+  PcodeOp *addop = sum->getDef();
-+  Varnode *low;
-+  if ((addop->code() == CPUI_INT_ADD || addop->code() == CPUI_PTRSUB) &&
-+      addop->numInput() == 2 && addop->getIn(1)->isConstant()) {
-+    low = addop->getIn(0);
-+    offset = addop->getIn(1)->getOffset();
-+  }
-+  else if (addop->code() == CPUI_PTRADD && addop->numInput() == 3 &&
-+           addop->getIn(1)->isConstant() && addop->getIn(2)->isConstant()) {
-+    low = addop->getIn(0);
-+    uintb index = addop->getIn(1)->getOffset();
-+    uintb scale = addop->getIn(2)->getOffset();
-+    if (scale == 0 || index > 0x3fff / scale)
-+      return (Varnode *)0;
-+    offset = index * scale;
-+  }
-+  else
-+    return (Varnode *)0;
-+  if (offset == 0 || offset > 0x3fff)
++  vector<C166PagedPointerTerm> terms;
++  uintb constant = 0;
++  if (!collectC166PagedPointerTerms(maskop->getIn(valueSlot),terms,constant,0) ||
++      terms.empty())
 +    return (Varnode *)0;
 +
-+  Varnode *lowWhole = recoverC166FarPointerWhole(low,0,segdef->getInnerSize());
++  Varnode *lowWhole = (Varnode *)0;
++  int4 pointerTerm = -1;
 +  Varnode *highWhole = recoverC166FarPointerWhole(op->getIn(1),
 +						  segdef->getInnerSize(),segdef->getBaseSize());
-+  if (lowWhole == (Varnode *)0 || highWhole != lowWhole)
++  for(int4 i=0;i<(int4)terms.size();++i) {
++    if (terms[i].scale != 1)
++      continue;
++    Varnode *candidate = recoverC166FarPointerWhole(terms[i].vn,0,
++						     segdef->getInnerSize());
++    if (candidate == (Varnode *)0 || candidate != highWhole)
++      continue;
++    if (pointerTerm >= 0)
++      return (Varnode *)0;
++    pointerTerm = i;
++    lowWhole = candidate;
++  }
++  if (lowWhole == (Varnode *)0) {
++    for(int4 i=0;i<(int4)terms.size();++i) {
++      if (terms[i].scale != 1)
++	continue;
++
++      vector<pair<Varnode *,Varnode *> > active;
++      C166FarPointerPairEvidence evidence = proveC166FarPointerPair(data,segdef,
++	  op->getIn(1),terms[i].vn,active,0);
++      if (!evidence.related || !evidence.typedOrigin)
++	continue;
++      if (pointerTerm >= 0)
++	return (Varnode *)0;
++      if (evidence.whole == (Varnode *)0) {
++	Datatype *type = inferC166FarPointerType(op,data,segdef);
++	if (type == (Datatype *)0)
++	  continue;
++	evidence.whole = buildC166FarPointerValue(op,data,
++	    stripC166FarPointerCasts(op->getIn(1)),
++	    stripC166FarPointerCasts(terms[i].vn),type);
++	if (evidence.whole == (Varnode *)0)
++	  continue;
++      }
++      pointerTerm = i;
++      lowWhole = evidence.whole;
++    }
++  }
++  if (lowWhole == (Varnode *)0) {
++    for(int4 i=0;i<(int4)terms.size();++i) {
++      if (terms[i].scale != 1)
++	continue;
++      Varnode *candidate = recoverC166FarPointerLoadPair(op,data,segdef,
++							 op->getIn(1),terms[i].vn);
++      if (candidate == (Varnode *)0)
++	continue;
++      if (pointerTerm >= 0)
++	return (Varnode *)0;
++      pointerTerm = i;
++      lowWhole = candidate;
++    }
++  }
++  if (lowWhole == (Varnode *)0 || pointerTerm < 0)
 +    return (Varnode *)0;
-+  Datatype *type = lowWhole->getTypeDefFacing();
++  Datatype *type = recoverC166CallOutputType(data,lowWhole);
++  if (type != (Datatype *)0) {
++    if (type->getMetatype() != TYPE_PTR ||
++	((TypePointer *)type)->getPtrTo()->getMetatype() == TYPE_CODE ||
++	getC166TaskingClassicLargeSegment(data,type) != segdef)
++      return (Varnode *)0;
++  }
++  else
++    type = lowWhole->getTypeDefFacing();
 +  SegmentOp *typedSegment = getC166TaskingClassicLargeSegment(data,type);
-+  if (typedSegment != segdef)
-+    return (Varnode *)0;
++  if (typedSegment != segdef) {
++    if (lowWhole->isTypeLock())
++      return (Varnode *)0;
++    Datatype *inferredType = inferC166FarPointerType(op,data,segdef);
++    if (inferredType == (Datatype *)0)
++      return (Varnode *)0;
++    PcodeOp *typedCopy = data.newOp(1,op->getAddr());
++    data.opSetOpcode(typedCopy,CPUI_COPY);
++    data.newUniqueOut(lowWhole->getSize(),typedCopy);
++    data.opSetInput(typedCopy,lowWhole,0);
++    data.opInsertBefore(typedCopy,op);
++    typedCopy->getOut()->updateType(inferredType);
++    lowWhole = typedCopy->getOut();
++    type = inferredType;
++    typedSegment = segdef;
++  }
 +  TypePointer *pointerType = (TypePointer *)type;
 +  if (pointerType->getPtrTo()->getMetatype() == TYPE_CODE)
 +    return (Varnode *)0;
-+  return lowWhole;
++
++  Varnode *result = lowWhole;
++  if (constant != 0) {
++    PcodeOp *addop = data.newOpBefore(op,CPUI_PTRSUB,result,
++				      data.newConstant(result->getSize(),constant));
++    addop->getOut()->updateType(type);
++    result = addop->getOut();
++  }
++  for(int4 i=0;i<(int4)terms.size();++i) {
++    if (i == pointerTerm)
++      continue;
++    Datatype *termType = terms[i].vn->getTypeDefFacing();
++    if (termType->getMetatype() == TYPE_PTR)
++      return (Varnode *)0;
++    Varnode *term = extendC166PagedPointerTerm(op,data,terms[i].vn,
++					       result->getSize());
++    if (term == (Varnode *)0)
++      return (Varnode *)0;
++    if (terms[i].scale != 1) {
++      PcodeOp *multop = data.newOpBefore(op,CPUI_INT_MULT,term,
++					 data.newConstant(term->getSize(),terms[i].scale));
++      term = multop->getOut();
++    }
++    PcodeOp *addop = data.newOpBefore(op,CPUI_INT_ADD,result,term);
++    addop->getOut()->updateType(type);
++    result = addop->getOut();
++  }
++  return result;
 +}
 +
  /// \class RuleSegment
  /// \brief Propagate constants through a SEGMENTOP
  void RuleSegment::getOpList(vector<uint4> &oplist) const
-@@ -9099,6 +9218,18 @@
+@@ -9099,6 +9919,14 @@ int4 RuleSegment::applyOp(PcodeOp *op,Funcdata &data)
      return 1;
    }
    else if (segdef->hasFarPointerSupport()) {
-+    uintb offset;
-+    Varnode *recoveredWhole = recoverC166PagedPointerAdd(op,data,segdef,offset);
++    Varnode *recoveredWhole = recoverC166PagedPointer(op,data,segdef);
 +    if (recoveredWhole != (Varnode *)0) {
-+      PcodeOp *addop = data.newOpBefore(op,CPUI_PTRSUB,recoveredWhole,
-+					data.newConstant(recoveredWhole->getSize(),offset));
-+      addop->getOut()->updateType(recoveredWhole->getTypeDefFacing());
 +      data.opRemoveInput(op,2);
 +      data.opRemoveInput(op,1);
-+      data.opSetInput(op,addop->getOut(),0);
++      data.opSetInput(op,recoveredWhole,0);
 +      data.opSetOpcode(op,CPUI_COPY);
 +      return 1;
 +    }
