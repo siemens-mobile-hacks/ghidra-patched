@@ -80,11 +80,16 @@ if [[ "${build_mode}" == "natives" ]]; then
 
 	found=0
 	while IFS= read -r -d '' native_dir; do
-		relative="${native_dir#"${source_dir}/"}"
-		install_relative="${relative/\/build\/os\//\/os\/}"
-		destination="${stage_dir}/$(dirname "${install_relative}")"
+		module_dir="${native_dir%/build/os/${platform}}"
+		if [[ "${module_dir}" == "${native_dir}" ||
+			"${module_dir}" != "${source_dir}/"* ]]; then
+			echo "Unexpected native output path: ${native_dir}" >&2
+			exit 1
+		fi
+		module_relative="${module_dir#"${source_dir}/"}"
+		destination="${stage_dir}/${module_relative}/os/${platform}"
 		mkdir -p "${destination}"
-		cp -a "${native_dir}" "${destination}/"
+		cp -a "${native_dir}/." "${destination}/"
 		found=1
 	done < <(find "${source_dir}/Ghidra" "${source_dir}/GPL" \
 		-type d -path "*/build/os/${platform}" \
@@ -95,14 +100,33 @@ if [[ "${build_mode}" == "natives" ]]; then
 		exit 1
 	fi
 
+	decompiler="${stage_dir}/Ghidra/Features/Decompiler/os/${platform}/decompile"
 	if [[ "${platform}" == win_* ]]; then
-		test -f "${stage_dir}/Ghidra/Features/Decompiler/os/${platform}/decompile.exe"
-	else
-		test -x "${stage_dir}/Ghidra/Features/Decompiler/os/${platform}/decompile"
+		decompiler="${decompiler}.exe"
+	fi
+	if [[ ! -f "${decompiler}" ]]; then
+		echo "Missing staged decompiler for ${platform}: ${decompiler}" >&2
+		find "${stage_dir}" -type f -print >&2
+		exit 1
+	fi
+	if [[ "${platform}" != win_* ]]; then
+		chmod +x "${decompiler}"
+		if [[ ! -x "${decompiler}" ]]; then
+			echo "Staged decompiler is not executable: ${decompiler}" >&2
+			exit 1
+		fi
 	fi
 
 	archive="ghidra-natives-${platform}.zip"
-	(cd "${stage_dir}" && zip -qr "${archive_dir}/${archive}" Ghidra GPL)
+	if command -v zip >/dev/null 2>&1; then
+		(cd "${stage_dir}" && zip -qr "${archive_dir}/${archive}" Ghidra GPL)
+	elif command -v jar >/dev/null 2>&1; then
+		(cd "${stage_dir}" && jar --create --file "${archive_dir}/${archive}" \
+			--no-manifest Ghidra GPL)
+	else
+		echo "Neither zip nor jar is available to create ${archive}" >&2
+		exit 1
+	fi
 	cp -v "${archive_dir}/${archive}" "${root_dir}/dist/${archive}"
 	exit 0
 fi
