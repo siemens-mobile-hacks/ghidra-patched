@@ -4,7 +4,8 @@ A Ghidra fork with fixes for reverse engineering Siemens phones.
 
 ## Differences from stock Ghidra
 
-- Segmented far pointers for processor specifications with `farpointer="yes"`:
+- TASKING Classic Large segmented far pointers for processor specifications
+  declaring the exact `c166.abi=tasking-classic-large` property:
   - Converts typed `PAGE:OFFSET` joins into far pointers.
   - Preserves physical addresses through p-code folding.
   - Resolves strings and symbols and makes decompiler tokens navigate to physical addresses.
@@ -13,9 +14,8 @@ A Ghidra fork with fixes for reverse engineering Siemens phones.
     pointers to a Function Definition retain their raw 24-bit
     `SEGMENT:OFFSET` value, while ordinary pointers continue to use the C166
     `PAGE:OFFSET` calculation.
-  - Scopes all C166-specific far-pointer behavior to processor specifications
-    declaring the exact `c166.abi=tasking-classic-large` property; other
-    processor and compiler models keep the stock behavior.
+  - Keeps other processor and compiler models on the stock segmented-pointer
+    behavior, including x86-16 and Z80 specifications with `farpointer="yes"`.
   - Hides representation-only masks and casts when a TASKING far pointer is
     formed from an R0-relative user-stack address.
   - Reconstructs page-local `EXTP` accesses from proven far-data pointer
@@ -35,7 +35,8 @@ A Ghidra fork with fixes for reverse engineering Siemens phones.
 - Preserves automatic hidden-return metadata for multipart pointers in the C166 TASKING Classic large model.
 - Preserves TASKING C166 Classic Large indirect R4 returns as logical `double`
   or aggregate values without adding a hidden return parameter; the protocol
-  change is gated by the exact processor-spec ABI property.
+  producers and native decompiler consumers are gated by the exact
+  processor-spec ABI property.
 
 ## Build
 
