@@ -1,0 +1,160 @@
+diff --git a/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc b/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
+--- a/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
++++ b/Ghidra/Features/Decompiler/src/decompile/cpp/ruleaction.cc
+@@ -9412,6 +9412,10 @@ struct C166FarPointerPairEvidence {
+   Varnode *whole;
+ };
+ 
++static C166FarPointerPairEvidence proveC166FarPointerPair(Funcdata &data,
++		SegmentOp *segdef,Varnode *high,Varnode *low,
++		vector<pair<Varnode *,Varnode *> > &active,int4 depth);
++
+ /// Match physical input halves against a formal far data-pointer parameter.
+ /// The join record is ABI data supplied by the compiler specification, so this
+ /// is stronger evidence than merely seeing adjacent registers.
+@@ -9499,6 +9503,24 @@ static C166FarPointerPairEvidence proveC166FarPointerPair(Funcdata &data,
+ 	highSub->getIn(1)->getOffset() == 0 &&
+ 	lowSub->getIn(1)->getOffset() == segdef->getBaseSize() &&
+ 	highSub->getIn(0)->getSpace()->getType() == IPTR_SPACEBASE) {
++      Varnode *stackWhole = highSub->getIn(0);
++      for(int4 i=0;i<8 && stackWhole->isWritten();++i) {
++	PcodeOp *stackDef = stackWhole->getDef();
++	if (stackDef->code() == CPUI_COPY || stackDef->code() == CPUI_INDIRECT) {
++	  stackWhole = stripC166FarPointerCasts(stackDef->getIn(0));
++	  continue;
++	}
++	if (stackDef->code() == CPUI_PIECE && stackDef->numInput() == 2) {
++	  // The stack whole has reverse byte order: PIECE(OFFSET,PAGE).
++	  // Re-prove the original PAGE:OFFSET pair so its semantic type and
++	  // formal whole survive the spill/reload.
++	  C166FarPointerPairEvidence source = proveC166FarPointerPair(data,segdef,
++	      stackDef->getIn(1),stackDef->getIn(0),active,depth+1);
++	  if (source.related && source.typedOrigin)
++	    return source;
++	}
++	break;
++      }
+       return { true, true, (Varnode *)0 };
+     }
+   }
+@@ -9592,6 +9614,94 @@ static C166FarPointerPairEvidence proveC166FarPointerPair(Funcdata &data,
+   return { true, hasTypedOrigin, commonWhole };
+ }
+ 
++/// Select a complete far-pointer field at an exact byte boundary of a typed
++/// source object.  A four-byte scalar or code pointer is authoritative negative
++/// evidence and suppresses the weaker terminal-use fallback.
++static Datatype *selectC166FarPointerSourceField(Datatype *rootType,uintb offset,
++						 Funcdata &data,SegmentOp *segdef,
++						 bool &hasDeclaredType)
++
++{
++  if (rootType == (Datatype *)0 || rootType->getMetatype() != TYPE_PTR)
++    return (Datatype *)0;
++  int8 fieldOffset = (int8)offset;
++  TypePointer *parent = (TypePointer *)0;
++  int8 parentOffset = 0;
++  TypePointer *fieldAddress = ((TypePointer *)rootType)->downChain(fieldOffset,
++				parent,parentOffset,false,*data.getArch()->types);
++  if (fieldAddress == (TypePointer *)0 || fieldOffset != 0)
++    return (Datatype *)0;
++  Datatype *fieldType = fieldAddress->getPtrTo();
++  if (fieldType->getSize() == segdef->getBaseSize() + segdef->getInnerSize())
++    hasDeclaredType = true;
++  if (getC166TaskingClassicLargeSegment(data,fieldType) != segdef ||
++      ((TypePointer *)fieldType)->getPtrTo()->getMetatype() == TYPE_CODE)
++    return (Datatype *)0;
++  return fieldType;
++}
++
++/// Recover the declared type of a far-pointer field before adjacent OFFSET and
++/// PAGE loads are joined.  The terminal access through the loaded pointer only
++/// describes the accessed value (often one word); the source address describes
++/// the complete four-byte pointer object and therefore provides stronger type
++/// evidence.  If the segmented source has already lost its pointee type, trace
++/// its PAGE/OFFSET inputs back to the typed ABI whole before descending to the
++/// field.
++static Datatype *inferC166FarPointerLoadSourceType(PcodeOp *load,
++						   Funcdata &data,SegmentOp *segdef,
++						   bool &hasDeclaredType)
++
++{
++  hasDeclaredType = false;
++  Varnode *address = load->getIn(1);
++  Datatype *addressType = address->getTypeReadFacing(load);
++  if (addressType->getMetatype() == TYPE_PTR) {
++    Datatype *fieldType = ((TypePointer *)addressType)->getPtrTo();
++    if (getC166TaskingClassicLargeSegment(data,fieldType) == segdef) {
++      hasDeclaredType = true;
++      if (((TypePointer *)fieldType)->getPtrTo()->getMetatype() != TYPE_CODE)
++	return fieldType;
++      return (Datatype *)0;
++    }
++  }
++
++  uintb offset;
++  Varnode *root = recoverC166PointerRoot(address,offset);
++  if (root == (Varnode *)0)
++    return (Datatype *)0;
++  Datatype *rootType = root->getTypeDefFacing();
++  PcodeOp *rootUse = root->loneDescend();
++  if (rootUse != (PcodeOp *)0) {
++    Datatype *readType = root->getTypeReadFacing(rootUse);
++    if (readType->getMetatype() == TYPE_PTR)
++      rootType = readType;
++  }
++  Datatype *fieldType = selectC166FarPointerSourceField(rootType,offset,data,
++							segdef,hasDeclaredType);
++  if (fieldType != (Datatype *)0 || hasDeclaredType)
++    return fieldType;
++
++  if (!root->isWritten() || root->getDef()->code() != CPUI_SEGMENTOP ||
++      root->getDef()->numInput() != 3)
++    return (Datatype *)0;
++  PcodeOp *sourceSegment = root->getDef();
++  uintb innerOffset;
++  Varnode *innerRoot = recoverC166PointerRoot(sourceSegment->getIn(2),innerOffset);
++  if (innerRoot == (Varnode *)0 ||
++      offset > ~((uintb)0) - innerOffset)
++    return (Datatype *)0;
++  vector<pair<Varnode *,Varnode *> > active;
++  C166FarPointerPairEvidence source = proveC166FarPointerPair(data,segdef,
++				sourceSegment->getIn(1),innerRoot,active,0);
++  if (!source.related || source.whole == (Varnode *)0)
++    return (Datatype *)0;
++  Datatype *wholeType = recoverC166CallOutputType(data,source.whole);
++  if (wholeType == (Datatype *)0)
++    wholeType = source.whole->getTypeDefFacing();
++  return selectC166FarPointerSourceField(wholeType,offset + innerOffset,data,
++						segdef,hasDeclaredType);
++}
++
+ static Varnode *buildC166FarPointerValue(PcodeOp *follow,Funcdata &data,
+ 					 Varnode *high,Varnode *low,
+ 					 Datatype *type);
+@@ -9619,7 +9729,11 @@ static Varnode *recoverC166FarPointerLoadPair(PcodeOp *segmentOp,Funcdata &data,
+ 					    segdef->getInnerSize()))
+     return (Varnode *)0;
+ 
+-  Datatype *type = inferC166FarPointerType(segmentOp,data,segdef);
++  bool hasDeclaredSourceType;
++  Datatype *type = inferC166FarPointerLoadSourceType(lowLoad,data,segdef,
++						     hasDeclaredSourceType);
++  if (type == (Datatype *)0 && !hasDeclaredSourceType)
++    type = inferC166FarPointerType(segmentOp,data,segdef);
+   if (type == (Datatype *)0)
+     return (Varnode *)0;
+   PcodeOp *wholeLoad = data.newOp(2,segmentOp->getAddr());
+@@ -9628,7 +9742,11 @@ static Varnode *recoverC166FarPointerLoadPair(PcodeOp *segmentOp,Funcdata &data,
+   data.opSetInput(wholeLoad,lowLoad->getIn(0),0);
+   data.opSetInput(wholeLoad,lowLoad->getIn(1),1);
+   data.opInsertBefore(wholeLoad,segmentOp);
+-  wholeLoad->getOut()->updateType(type,true,false);
++  // A declared source-field type is authoritative.  A type inferred only
++  // from the terminal memory access is provisional: locking it here can
++  // freeze an early undefined2 * and prevent the enclosing structure field
++  // type from propagating on a later heritage/type-recovery pass.
++  wholeLoad->getOut()->updateType(type,hasDeclaredSourceType,false);
+   return wholeLoad->getOut();
+ }
+ 

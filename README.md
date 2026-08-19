@@ -21,7 +21,8 @@ A Ghidra fork with fixes for reverse engineering Siemens phones.
   - Reconstructs page-local `EXTP` accesses from proven far-data pointer
     halves as ordinary constant or scalar-indexed pointer arithmetic, including
     nested fields, adjacent post-increment loads, lock-step control flow, and
-    reverse PAGE/OFFSET stack spills.
+    reverse PAGE/OFFSET stack spills, while preserving declared nested-pointer
+    pointee types across split word loads.
   - Rejects function-pointer and scalar call results before folding physical
     `R5:R4` halves into a far-data pointer.
   - Raises the type-recovery pass budget from 7 to 20 only for the exact
