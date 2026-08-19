@@ -18,6 +18,9 @@ A Ghidra fork with fixes for reverse engineering Siemens phones.
     processor and compiler models keep the stock behavior.
   - Hides representation-only masks and casts when a TASKING far pointer is
     formed from an R0-relative user-stack address.
+  - Reconstructs page-local `EXTP` field accesses from one typed far-data
+    pointer as ordinary pointer arithmetic instead of exposing page shifts and
+    `0x3fff` offset masks.
 - Extends Auto Structure for TASKING Classic Large far-data pointers, including
   split PAGE:OFFSET globals and indexed array elements, and retypes the actual
   four-byte global pointer instead of a selected 16-bit index variable.
