@@ -3,7 +3,7 @@
 set -euo pipefail
 
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-version="${GHIDRA_VERSION:-12.1.2}"
+version="${GHIDRA_VERSION:-12.1.3}"
 tag="Ghidra_${version}_build"
 source_dir="${root_dir}/build/ghidra"
 build_mode="${GHIDRA_BUILD_MODE:-distribution}"
